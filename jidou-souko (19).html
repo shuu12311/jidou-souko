@@ -1,0 +1,2455 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>自動倉庫管理システム</title>
+
+<!-- Firebase SDKs -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import { getFirestore, doc, setDoc, getDoc, getDocs, collection, addDoc, query, orderBy, updateDoc, deleteDoc, Timestamp }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  // ========== Firebase設定 ==========
+  const firebaseConfig = {
+    apiKey: "AIzaSyA33aqmYVplQE77FVpbXgZPFH27jyx2SvE",
+    authDomain: "jidou-souko.firebaseapp.com",
+    projectId: "jidou-souko",
+    storageBucket: "jidou-souko.firebasestorage.app",
+    messagingSenderId: "764306513933",
+    appId: "1:764306513933:web:7294dd6f2b3571165c7544"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db = getFirestore(app);
+
+  // ========== 状態管理 ==========
+  let currentUser = null;
+  let locationsData = {}; // ロケデータキャッシュ
+  let itemMaster = [];    // 品目マスタ
+  let selectedLoc = null; // 選択中ロケ
+
+  const MACHINES = ['1', '2'];
+  const COLS = 18;
+  const ROWS = 10;
+
+  // ロケID: "機号-連-段" 例: "1-3-7"
+  const locId = (machine, col, row) => `${machine}-${col}-${row}`;
+
+  // ========== ページ初期化 ==========
+  onAuthStateChanged(auth, user => {
+    currentUser = user;
+    if (user) {
+      showApp();
+      loadAll();
+    } else {
+      showLogin();
+    }
+  });
+
+  function showLogin() {
+    document.getElementById('login-screen').style.display = 'flex';
+    document.getElementById('app-screen').style.display = 'none';
+  }
+
+  function showApp() {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app-screen').style.display = 'block';
+  }
+
+  // ========== ログイン ==========
+  window.doLogin = async () => {
+    const email = document.getElementById('login-email').value.trim();
+    const pass  = document.getElementById('login-pass').value;
+    const errEl = document.getElementById('login-error');
+    errEl.textContent = '';
+    try {
+      await signInWithEmailAndPassword(auth, email, pass);
+    } catch(e) {
+      errEl.textContent = 'IDまたはパスワードが違います';
+    }
+  };
+
+  // ハンバーガーメニュー
+  window.toggleHamburger = () => {
+    document.getElementById('hamburger-menu').classList.toggle('open');
+  };
+  window.closeHamburger = () => {
+    document.getElementById('hamburger-menu').classList.remove('open');
+  };
+  // メニュー外クリックで閉じる
+  document.addEventListener('click', e => {
+    const menu = document.getElementById('hamburger-menu');
+    const btn = document.getElementById('hamburger-btn');
+    if (menu && btn && !menu.contains(e.target) && !btn.contains(e.target)) {
+      menu.classList.remove('open');
+    }
+  });
+
+  window.doLogout = async () => {
+    await signOut(auth);
+  };
+
+  // Enterキーでログイン
+  document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('login-pass').addEventListener('keydown', e => {
+      if (e.key === 'Enter') window.doLogin();
+    });
+    document.getElementById('shipout-memo').addEventListener('keydown', e => {
+      if (e.key === 'Enter') window.doShipOut();
+    });
+  });
+
+  // ========== データ読み込み ==========
+  async function loadAll() {
+    await Promise.all([loadLocations(), loadItemMaster()]);
+    renderGrids();
+  }
+
+  async function loadLocations() {
+    const snap = await getDocs(collection(db, 'locations'));
+    locationsData = {};
+    snap.forEach(d => { locationsData[d.id] = d.data(); });
+  }
+
+  async function loadItemMaster() {
+    const snap = await getDocs(collection(db, 'itemMaster'));
+    itemMaster = [];
+    snap.forEach(d => itemMaster.push({ id: d.id, ...d.data() }));
+    window.__itemMasterRef = itemMaster;
+  }
+
+  // 品目マスタモーダルからの更新を受け取る
+  window.__setItemMaster = (items) => {
+    itemMaster = items.map(i => ({ id: i.id, spec: i.spec }));
+    window.__itemMasterRef = itemMaster;
+  };
+
+  // 棚卸スクリプトからロケデータを更新するフック
+  window.__updateLocData = (id, data) => {
+    locationsData[id] = data;
+    renderGrids();
+  };
+
+  // 在庫検索スクリプトからlocationsDataを参照できるようにwindowに公開
+  window.__getLocationsData = () => locationsData;
+
+  // 棚卸終了後にメイン画面を再読み込みするフック
+  window.__reloadMain = async () => {
+    await loadAll();
+  };
+
+  // ========== グリッド描画 ==========
+  function renderGrids() {
+    MACHINES.forEach(m => {
+      const container = document.getElementById(`grid-${m}`);
+      if (!container) return;
+      container.innerHTML = '';
+
+      // ヘッダー行（連番）
+      const header = document.createElement('div');
+      header.className = 'grid-header-row';
+      header.innerHTML = '<div class="grid-corner"></div>';
+      for (let c = 1; c <= COLS; c++) {
+        const h = document.createElement('div');
+        h.className = 'grid-header-cell';
+        h.textContent = c + '連';
+        header.appendChild(h);
+      }
+      container.appendChild(header);
+
+      // 段（10→1の順で上から）
+      for (let r = ROWS; r >= 1; r--) {
+        const row = document.createElement('div');
+        row.className = 'grid-row';
+
+        const rowLabel = document.createElement('div');
+        rowLabel.className = 'grid-row-label';
+        rowLabel.textContent = r + '段';
+        row.appendChild(rowLabel);
+
+        for (let c = 1; c <= COLS; c++) {
+          const id = locId(m, c, r);
+          const cell = document.createElement('div');
+          cell.className = 'grid-cell ' + getCellClass(id);
+          cell.title = id;
+          cell.innerHTML = getCellLabel(id);
+          cell.addEventListener('click', () => openLocModal(id));
+          row.appendChild(cell);
+        }
+        container.appendChild(row);
+      }
+    });
+  }
+
+  function getCellClass(id) {
+    const loc = locationsData[id];
+    if (!loc) return 'cell-free'; // 管理外・空き
+    if (loc.type === 'other') return 'cell-other'; // 管理外・使用中
+    // オリンピアバーナ置場
+    const items = loc.items || [];
+    if (items.length === 0) return 'cell-olympia-empty';
+    if (loc.full || items.length >= 2) return 'cell-olympia-full';
+    return 'cell-olympia-one';
+  }
+
+  function getCellLabel(id) {
+    const loc = locationsData[id];
+    if (!loc) return '';
+    if (loc.type === 'other') return '<span class="cell-text">使用中</span>';
+    const items = loc.items || [];
+    if (items.length === 0) return '<span class="cell-text">空</span>';
+    if (loc.full || items.length >= 2) return '<span class="cell-text">満</span>';
+    return '<span class="cell-text">1個</span>';
+  }
+
+  // ========== ロケモーダル ==========
+  window.openLocModal = async (id) => {
+    selectedLoc = id;
+    const loc = locationsData[id];
+    const modal = document.getElementById('loc-modal');
+    const title = document.getElementById('loc-modal-title');
+    const body  = document.getElementById('loc-modal-body');
+
+    title.textContent = 'ロケ ' + id;
+    body.innerHTML = '';
+
+    if (!loc) {
+      // 管理外・空き → 設定メニューのみ
+      body.innerHTML = `
+        <p class="modal-status free">管理外（空き）</p>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" onclick="setLocType('${id}','olympia')">オリンピアバーナ置場に設定</button>
+          <button class="btn btn-secondary" onclick="setLocType('${id}','other')">使用中（管理外）に設定</button>
+        </div>`;
+    } else if (loc.type === 'other') {
+      body.innerHTML = `
+        <p class="modal-status other">管理外（使用中）</p>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" onclick="setLocType('${id}','olympia')">オリンピアバーナ置場に変更</button>
+          <button class="btn btn-danger" onclick="setLocType('${id}',null)">空きに戻す</button>
+        </div>`;
+    } else {
+      // オリンピアバーナ置場
+      const items = loc.items || [];
+      let itemsHtml = '';
+      if (items.length === 0) {
+        itemsHtml = '<p class="empty-note">現在、入庫物なし</p>';
+      } else {
+        itemsHtml = '<table class="item-table"><thead><tr><th>部品番号</th><th>型式・仕様</th><th>製造番号</th><th>入庫日</th><th>操作</th></tr></thead><tbody>';
+        items.forEach((item, idx) => {
+          itemsHtml += `<tr>
+            <td>${item.partNo}</td>
+            <td>${item.spec}</td>
+            <td>${item.serialNo}</td>
+            <td>${item.inDate}</td>
+            <td><button class="btn btn-danger btn-sm" onclick="openShipOutModal('${id}',${idx})">出庫</button></td>
+          </tr>`;
+        });
+        itemsHtml += '</tbody></table>';
+      }
+
+      const canReceive = items.length < 2 && !loc.full;
+      body.innerHTML = `
+        <p class="modal-status olympia">オリンピアバーナ置場 ／ 
+          ${items.length === 0 ? '空' : loc.full || items.length >= 2 ? '満' : '1個（空きあり）'}
+        </p>
+        ${itemsHtml}
+        ${canReceive ? `
+        <div class="receive-form">
+          <h4>入庫登録</h4>
+          <div class="form-row">
+            <label>部品番号</label>
+            <input id="f-partno" type="text" placeholder="例: 302030A0" oninput="onPartNoInput()" autocomplete="off">
+          </div>
+          <div class="form-row">
+            <label>型式・仕様</label>
+            <input id="f-spec" type="text" placeholder="部品番号入力で自動入力">
+          </div>
+          <div style="margin-bottom:10px">
+            <button type="button" class="btn btn-secondary btn-sm" onclick="openSpecSearch('receive')" style="font-size:11px">
+              🔍 部品番号がわからない場合はこちら（絞り込み検索）
+            </button>
+          </div>
+          <div class="form-row">
+            <label>製造番号</label>
+            <input id="f-serial" type="text" placeholder="例: 2024001">
+          </div>
+          <div class="form-row">
+            <label>入庫日</label>
+            <input id="f-indate" type="date" value="${today()}">
+          </div>
+          <div class="form-row">
+            <label>備考</label>
+            <input id="f-note" type="text" placeholder="任意">
+          </div>
+          <div class="form-row">
+            <label></label>
+            <label class="check-label">
+              <input type="checkbox" id="f-full"> この1個で満（大きいため2個目不可）
+            </label>
+          </div>
+          <div class="modal-actions">
+            <button class="btn btn-primary" onclick="doReceive('${id}')">入庫登録</button>
+          </div>
+        </div>` : `<p class="full-note">このロケは満のため入庫できません</p>`}
+        <div class="modal-actions" style="margin-top:12px; border-top:1px solid #e5e7eb; padding-top:12px;">
+          ${items.length === 1 && !loc.full ? `<button class="btn btn-secondary btn-sm" onclick="setLocFull('${id}')">満に変更（2個目不可）</button>` : ''}
+          ${loc.full && items.length === 1 ? `<button class="btn btn-secondary btn-sm" onclick="setLocNotFull('${id}')">満を解除（空きあり）</button>` : ''}
+          <button class="btn btn-danger btn-sm" onclick="setLocType('${id}',null)">空きに戻す（管理外）</button>
+        </div>`;
+    }
+
+    modal.style.display = 'flex';
+  };
+
+  window.closeModal = () => {
+    document.getElementById('loc-modal').style.display = 'none';
+    selectedLoc = null;
+  };
+
+  // ========== ロケタイプ変更 ==========
+  window.setLocType = async (id, type) => {
+    if (type === null) {
+      // モノが入っている場合は2重確認
+      const loc = locationsData[id];
+      const items = loc && loc.items ? loc.items : [];
+      if (items.length > 0) {
+        const first = confirm(`このロケには現在${items.length}個登録されています。\n本当に空きに戻しますか？\n（登録データはすべて削除されます）`);
+        if (!first) return;
+        const second = confirm('もう一度確認します。\nデータは復元できません。\n本当によろしいですか？');
+        if (!second) return;
+      } else {
+        if (!confirm('このロケを空きに戻しますか？')) return;
+      }
+      await deleteDoc(doc(db, 'locations', id));
+      delete locationsData[id];
+    } else if (type === 'olympia') {
+      const data = { type: 'olympia', items: [], full: false };
+      await setDoc(doc(db, 'locations', id), data);
+      locationsData[id] = data;
+    } else if (type === 'other') {
+      const data = { type: 'other' };
+      await setDoc(doc(db, 'locations', id), data);
+      locationsData[id] = data;
+    }
+    closeModal();
+    renderGrids();
+  };
+
+  // ========== 満に変更 / 満を解除 ==========
+  window.setLocFull = async (id) => {
+    const loc = locationsData[id];
+    const updated = { ...loc, full: true };
+    await setDoc(doc(db, 'locations', id), updated);
+    locationsData[id] = updated;
+    closeModal();
+    renderGrids();
+  };
+
+  window.setLocNotFull = async (id) => {
+    const loc = locationsData[id];
+    const updated = { ...loc, full: false };
+    await setDoc(doc(db, 'locations', id), updated);
+    locationsData[id] = updated;
+    closeModal();
+    renderGrids();
+  };
+
+  // ========== 入庫 ==========
+  window.doReceive = async (id) => {
+    const partNo   = document.getElementById('f-partno').value.trim();
+    const spec     = document.getElementById('f-spec').value.trim();
+    const serialNo = document.getElementById('f-serial').value.trim();
+    const inDate   = document.getElementById('f-indate').value;
+    const note     = document.getElementById('f-note').value.trim();
+    const fullChk  = document.getElementById('f-full').checked;
+
+    if (!partNo || !serialNo || !inDate) {
+      alert('部品番号・製造番号・入庫日は必須です');
+      return;
+    }
+
+    const loc = locationsData[id];
+    const items = [...(loc.items || [])];
+    const newItem = { partNo, spec, serialNo, inDate, note };
+    items.push(newItem);
+
+    const full = fullChk || items.length >= 2;
+    await setDoc(doc(db, 'locations', id), { ...loc, items, full });
+    locationsData[id] = { ...loc, items, full };
+
+    // 履歴追加
+    await addDoc(collection(db, 'history'), {
+      action: 'in',
+      locId: id,
+      partNo, spec, serialNo, inDate, note,
+      timestamp: Timestamp.now(),
+      user: currentUser?.email || ''
+    });
+
+    closeModal();
+    renderGrids();
+  };
+
+  // ========== 出庫 ==========
+  window.openShipOutModal = (id, idx) => {
+    document.getElementById('shipout-loc-id').value = id;
+    document.getElementById('shipout-idx').value = idx;
+    document.getElementById('shipout-memo').value = '';
+    document.getElementById('shipout-modal').style.display = 'flex';
+  };
+
+  window.closeShipOutModal = () => {
+    document.getElementById('shipout-modal').style.display = 'none';
+  };
+
+  window.doShipOut = async () => {
+    const id   = document.getElementById('shipout-loc-id').value;
+    const idx  = parseInt(document.getElementById('shipout-idx').value);
+    const memo = document.getElementById('shipout-memo').value.trim();
+
+    const loc = locationsData[id];
+    const items = [...(loc.items || [])];
+    const removed = items.splice(idx, 1)[0];
+    const full = items.length >= 2;
+
+    await setDoc(doc(db, 'locations', id), { ...loc, items, full });
+    locationsData[id] = { ...loc, items, full };
+
+    await addDoc(collection(db, 'history'), {
+      action: 'out',
+      locId: id,
+      ...removed,
+      outDate: today(),
+      outMemo: memo,
+      timestamp: Timestamp.now(),
+      user: currentUser?.email || ''
+    });
+
+    closeShipOutModal();
+    closeModal();
+    renderGrids();
+  };
+
+  // ========== 品目検索（インクリメンタル） ==========
+  // 部品番号直打ち→型式自動入力
+  window.onPartNoInput = () => {
+    const partNo = document.getElementById('f-partno').value.trim();
+    const found = itemMaster.find(item => item.id === partNo);
+    document.getElementById('f-spec').value = found ? (found.spec || '') : '';
+  };
+
+  // 検索欄の折りたたみ
+  window.togglePartSearch = () => {
+    const area = document.getElementById('f-search-area');
+    area.style.display = area.style.display === 'none' ? 'block' : 'none';
+  };
+
+  window.searchItem = () => {
+    const q = document.getElementById('f-search').value.trim();
+    const results = document.getElementById('search-results');
+    if (!q) { results.innerHTML = ''; results.style.display = 'none'; return; }
+
+    const lower = q.toLowerCase();
+    const matched = itemMaster.filter(item =>
+      (item.spec || '').toLowerCase().includes(lower) ||
+      (item.id  || '').toLowerCase().includes(lower)
+    ).slice(0, 10);
+
+    if (matched.length === 0) {
+      results.innerHTML = '<div class="search-item no-result">該当なし</div>';
+    } else {
+      results.innerHTML = matched.map(item =>
+        `<div class="search-item" onclick="selectItem('${item.id}','${(item.spec||'').replace(/'/g,"\\'")}')">
+          <span class="search-partno">${item.id}</span>
+          <span class="search-spec">${item.spec || ''}</span>
+        </div>`
+      ).join('');
+    }
+    results.style.display = 'block';
+  };
+
+  window.selectItem = (partNo, spec) => {
+    document.getElementById('f-partno').value = partNo;
+    document.getElementById('f-spec').value = spec;
+    document.getElementById('f-search').value = '';
+    document.getElementById('search-results').style.display = 'none';
+    document.getElementById('f-search-area').style.display = 'none';
+  };
+
+  // ========== 履歴モーダル ==========
+  window.openHistory = async () => {
+    const modal = document.getElementById('history-modal');
+    const body  = document.getElementById('history-body');
+    body.innerHTML = '<tr><td colspan="6">読み込み中...</td></tr>';
+    modal.style.display = 'flex';
+
+    const q = query(collection(db, 'history'), orderBy('timestamp', 'desc'));
+    const snap = await getDocs(q);
+    const rows = [];
+    snap.forEach(d => rows.push(d.data()));
+
+    if (rows.length === 0) {
+      body.innerHTML = '<tr><td colspan="6">履歴がありません</td></tr>';
+      return;
+    }
+
+    body.innerHTML = rows.map(r => `
+      <tr>
+        <td>${r.action === 'in' ? '入庫' : '出庫'}</td>
+        <td>${r.locId}</td>
+        <td>${r.partNo || ''}</td>
+        <td>${r.spec || ''}</td>
+        <td>${r.serialNo || ''}</td>
+        <td>${r.action === 'in' ? r.inDate : r.outDate || ''}</td>
+        <td>${r.outMemo || r.note || ''}</td>
+      </tr>
+    `).join('');
+  };
+
+  window.closeHistory = () => {
+    document.getElementById('history-modal').style.display = 'none';
+  };
+
+
+  // ========== 復元ポイント作成 ==========
+  window.createSnapshot = async () => {
+    if (!confirm('現在の状態を復元ポイントとして保存します。\nダウンロードされるHTMLファイルを大切に保管してください。')) return;
+
+    // Firestoreから全データ取得
+    const [locSnap, histSnap] = await Promise.all([
+      getDocs(collection(db, 'locations')),
+      getDocs(collection(db, 'history'))
+    ]);
+
+    const locData = {};
+    locSnap.forEach(d => { locData[d.id] = d.data(); });
+
+    const histData = [];
+    histSnap.forEach(d => { histData.push({ id: d.id, ...d.data() }); });
+
+    // Timestampをシリアライズ
+    const safeHist = histData.map(h => {
+      const obj = { ...h };
+      if (obj.timestamp && obj.timestamp.toDate) {
+        obj.timestamp = obj.timestamp.toDate().toISOString();
+      }
+      return obj;
+    });
+
+    const now = new Date();
+    const dateStr = now.getFullYear() + String(now.getMonth()+1).padStart(2,'0') + String(now.getDate()).padStart(2,'0') + '_' + String(now.getHours()).padStart(2,'0') + String(now.getMinutes()).padStart(2,'0');
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyA33aqmYVplQE77FVpbXgZPFH27jyx2SvE",
+      authDomain: "jidou-souko.firebaseapp.com",
+      projectId: "jidou-souko",
+      storageBucket: "jidou-souko.firebasestorage.app",
+      messagingSenderId: "764306513933",
+      appId: "1:764306513933:web:7294dd6f2b3571165c7544"
+    };
+
+    const html = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>復元ポイント ${dateStr}</title>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, doc, setDoc, addDoc, collection, getDocs, deleteDoc, writeBatch, Timestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import { getAuth, signInWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+  const app  = initializeApp(${JSON.stringify(firebaseConfig)});
+  const db   = getFirestore(app);
+  const auth = getAuth(app);
+
+  const LOC_DATA  = ${JSON.stringify(locData, null, 2)};
+  const HIST_DATA = ${JSON.stringify(safeHist, null, 2)};
+
+  window.doRestore = async () => {
+    const email = document.getElementById('email').value.trim();
+    const pass  = document.getElementById('pass').value;
+    const log   = document.getElementById('log');
+
+    log.style.color = '#475569';
+    log.textContent = 'ログイン中...';
+    try {
+      await signInWithEmailAndPassword(auth, email, pass);
+    } catch(e) {
+      log.style.color = '#ef4444';
+      log.textContent = 'ログイン失敗: ' + e.message;
+      return;
+    }
+
+    if (!confirm('現在のデータをすべて削除して復元します。よろしいですか？')) return;
+
+    // locationsを全削除
+    log.textContent = '既存データ削除中...';
+    const locSnap = await getDocs(collection(db, 'locations'));
+    const histSnap = await getDocs(collection(db, 'history'));
+    const delBatch = writeBatch(db);
+    locSnap.forEach(d => delBatch.delete(d.ref));
+    histSnap.forEach(d => delBatch.delete(d.ref));
+    await delBatch.commit();
+
+    // locationsを復元
+    log.textContent = 'ロケデータ復元中...';
+    const locEntries = Object.entries(LOC_DATA);
+    const CHUNK = 400;
+    for (let i = 0; i < locEntries.length; i += CHUNK) {
+      const batch = writeBatch(db);
+      locEntries.slice(i, i + CHUNK).forEach(([id, data]) => {
+        batch.set(doc(db, 'locations', id), data);
+      });
+      await batch.commit();
+    }
+
+    // 履歴を復元
+    log.textContent = '履歴データ復元中...';
+    for (const h of HIST_DATA) {
+      const { id, timestamp, ...rest } = h;
+      const ts = timestamp ? Timestamp.fromDate(new Date(timestamp)) : Timestamp.now();
+      await addDoc(collection(db, 'history'), { ...rest, timestamp: ts });
+    }
+
+    log.style.color = 'green';
+    log.textContent = '✓ 復元完了！アプリを再読み込みしてください。';
+    document.getElementById('btn').disabled = true;
+  };
+<\/script>
+<style>
+  body { font-family: sans-serif; max-width: 420px; margin: 60px auto; padding: 20px; }
+  h2 { color: #1e293b; } p { color: #ef4444; font-size:12px; margin-bottom:16px; }
+  input { width:100%; padding:8px; margin-bottom:10px; box-sizing:border-box; border:1px solid #ccc; border-radius:4px; font-size:14px; }
+  button { width:100%; padding:10px; background:#ef4444; color:#fff; border:none; border-radius:6px; font-size:15px; cursor:pointer; }
+  button:disabled { background:#94a3b8; }
+  #log { margin-top:16px; font-size:13px; color:#475569; min-height:20px; }
+  .info { background:#fef08a; padding:10px; border-radius:6px; font-size:12px; margin-bottom:16px; }
+</style>
+</head>
+<body>
+  <h2>🔄 復元ポイント</h2>
+  <div class="info">作成日時：${dateStr.replace('_',' ').replace(/(\d{4})(\d{2})(\d{2}) (\d{2})(\d{2})/,'$1/$2/$3 $4:$5')}<br>ロケ数：${Object.keys(locData).length}件 ／ 履歴：${safeHist.length}件</div>
+  <p>⚠️ 実行するとFirebaseの現在のデータがすべて上書きされます。</p>
+  <input id="email" type="email" placeholder="ログインID">
+  <input id="pass" type="password" placeholder="パスワード">
+  <button id="btn" onclick="doRestore()">この時点に復元する</button>
+  <div id="log"></div>
+</body>
+</html>`;
+
+    // ダウンロード
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '復元ポイント_' + dateStr + '.html';
+    a.click();
+    URL.revokeObjectURL(url);
+
+    alert('復元ポイントを保存しました！\nダウンロードされたHTMLファイルを大切に保管してください。');
+  };
+
+  // ========== CSVエクスポート ==========
+  window.exportCSV = () => {
+    const rows = [];
+    rows.push(['ラックNo', '部品番号', '型式・仕様', '製造番号', '入庫日', '備考', 'ロケ状態']);
+
+    const sortedIds = Object.keys(locationsData).sort((a, b) => {
+      const pa = a.split('-').map(Number);
+      const pb = b.split('-').map(Number);
+      for (let i = 0; i < 3; i++) {
+        if (pa[i] !== pb[i]) return pa[i] - pb[i];
+      }
+      return 0;
+    });
+
+    for (const id of sortedIds) {
+      const loc = locationsData[id];
+      if (loc.type === 'other') {
+        rows.push([id, '', '', '', '', '', '管理外（使用中）']);
+      } else if (loc.type === 'olympia') {
+        const items = loc.items || [];
+        if (items.length === 0) {
+          rows.push([id, '', '', '', '', '', '置場・空']);
+        } else {
+          const status = loc.full || items.length >= 2 ? '置場・満' : '置場・1個';
+          for (const item of items) {
+            rows.push([id, item.partNo || '', item.spec || '', item.serialNo || '', item.inDate || '', item.note || '', status]);
+          }
+        }
+      }
+    }
+
+    const csv = '\uFEFF' + rows.map(r =>
+      r.map(v => '"' + String(v).replace(/"/g, '""') + '"').join(',')
+    ).join('\r\n');
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const now = new Date();
+    const dateStr = now.getFullYear() + String(now.getMonth()+1).padStart(2,'0') + String(now.getDate()).padStart(2,'0');
+    a.href = url;
+    a.download = '自動倉庫在庫_' + dateStr + '.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // ========== ユーティリティ ==========
+  function today() {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  // モーダル外クリックで閉じる
+  document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('loc-modal').addEventListener('click', e => {
+      if (e.target === e.currentTarget) closeModal();
+    });
+    document.getElementById('history-modal').addEventListener('click', e => {
+      if (e.target === e.currentTarget) closeHistory();
+    });
+  });
+</script>
+
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Hiragino Sans', 'Meiryo', sans-serif;
+    background: #f0f4f8;
+    color: #1e293b;
+    min-height: 100vh;
+  }
+
+  /* ===== ログイン画面 ===== */
+  #login-screen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    background: #1e293b;
+  }
+
+  .login-box {
+    background: #fff;
+    border-radius: 12px;
+    padding: 40px 36px;
+    width: 340px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+  }
+
+  .login-box h1 {
+    font-size: 18px;
+    font-weight: 700;
+    color: #1e293b;
+    margin-bottom: 4px;
+  }
+
+  .login-box p {
+    font-size: 12px;
+    color: #64748b;
+    margin-bottom: 24px;
+  }
+
+  .login-box input {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    font-size: 14px;
+    margin-bottom: 12px;
+    outline: none;
+    transition: border-color .2s;
+  }
+
+  .login-box input:focus { border-color: #3b82f6; }
+
+  .login-error {
+    color: #ef4444;
+    font-size: 12px;
+    min-height: 18px;
+    margin-bottom: 8px;
+  }
+
+  /* ===== アプリ画面 ===== */
+  #app-screen { display: none; }
+
+  .app-header {
+    background: #1e293b;
+    color: #fff;
+    padding: 0 20px;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .app-header h1 { font-size: 16px; font-weight: 700; letter-spacing: .05em; }
+
+  .header-actions { display: flex; gap: 8px; align-items: center; position: relative; }
+
+  .header-btns-pc { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .hamburger-btn {
+    display: none;
+    background: none;
+    border: 1px solid #475569;
+    color: #fff;
+    font-size: 22px;
+    line-height: 1;
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
+  .hamburger-menu {
+    display: none;
+    position: absolute;
+    top: 52px;
+    right: 0;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    z-index: 200;
+    min-width: 200px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+    overflow: hidden;
+  }
+
+  .hamburger-menu.open { display: block; }
+
+  .hamburger-menu button {
+    display: block;
+    width: 100%;
+    padding: 14px 20px;
+    background: none;
+    border: none;
+    border-bottom: 1px solid #334155;
+    color: #fff;
+    font-size: 14px;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .hamburger-menu button:last-child { border-bottom: none; }
+  .hamburger-menu button:hover { background: #334155; }
+
+  @media (max-width: 768px) {
+    .header-btns-pc { display: none; }
+    .hamburger-btn { display: block; }
+  }
+
+  .main-content { padding: 20px; max-width: 100%; overflow-x: auto; }
+
+  .machine-section { margin-bottom: 32px; }
+
+  .machine-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: #334155;
+    margin-bottom: 10px;
+    padding-left: 4px;
+    border-left: 4px solid #3b82f6;
+    padding-left: 10px;
+  }
+
+  /* ===== グリッド ===== */
+  .grid-wrap { overflow-x: auto; }
+
+  .grid-header-row, .grid-row {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 2px;
+  }
+
+  .grid-corner {
+    width: 36px;
+    min-width: 36px;
+  }
+
+  .grid-header-cell {
+    width: 52px;
+    min-width: 52px;
+    text-align: center;
+    font-size: 10px;
+    color: #64748b;
+    padding: 2px 0;
+  }
+
+  .grid-row-label {
+    width: 36px;
+    min-width: 36px;
+    font-size: 10px;
+    color: #64748b;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding-right: 4px;
+  }
+
+  .grid-cell {
+    width: 52px;
+    min-width: 52px;
+    height: 44px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity .15s, transform .1s;
+    border: 1px solid transparent;
+  }
+
+  .grid-cell:hover { opacity: .85; transform: scale(1.05); }
+
+  .cell-text { font-size: 10px; font-weight: 600; }
+
+  /* セル色 */
+  .cell-free          { background: #e2e8f0; border-color: #cbd5e1; }
+  .cell-other         { background: #94a3b8; border-color: #64748b; }
+  .cell-other .cell-text { color: #fff; font-size: 9px; }
+  .cell-olympia-empty { background: #dbeafe; border-color: #93c5fd; }
+  .cell-olympia-empty .cell-text { color: #1d4ed8; }
+  .cell-olympia-one   { background: #fef08a; border-color: #facc15; }
+  .cell-olympia-one .cell-text   { color: #854d0e; }
+  .cell-olympia-full  { background: #fca5a5; border-color: #f87171; }
+  .cell-olympia-full .cell-text  { color: #7f1d1d; }
+
+  /* 凡例 */
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 16px;
+    font-size: 12px;
+    align-items: center;
+  }
+
+  .legend-item { display: flex; align-items: center; gap: 5px; }
+
+  .legend-box {
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+    border: 1px solid rgba(0,0,0,.1);
+  }
+
+  /* ===== ボタン ===== */
+  .btn {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .15s;
+  }
+  .btn:hover { opacity: .85; }
+  .btn-primary   { background: #3b82f6; color: #fff; }
+  .btn-secondary { background: #e2e8f0; color: #334155; }
+  .btn-danger    { background: #ef4444; color: #fff; }
+  .btn-sm        { padding: 4px 10px; font-size: 12px; }
+  .btn-outline   { background: transparent; border: 1px solid #cbd5e1; color: #334155; }
+
+  /* ===== モーダル ===== */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.45);
+    z-index: 200;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+
+  .modal-box {
+    background: #fff;
+    border-radius: 12px;
+    width: 100%;
+    max-width: 580px;
+    max-height: 90vh;
+    overflow-y: auto;
+    padding: 24px;
+    position: relative;
+  }
+
+  .modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+
+  .modal-header h3 { font-size: 16px; font-weight: 700; }
+
+  .modal-close {
+    background: none;
+    border: none;
+    font-size: 22px;
+    cursor: pointer;
+    color: #64748b;
+    line-height: 1;
+    padding: 0 4px;
+  }
+
+  .modal-status {
+    font-size: 13px;
+    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 6px;
+    margin-bottom: 14px;
+    display: inline-block;
+  }
+
+  .modal-status.free          { background: #e2e8f0; color: #475569; }
+  .modal-status.other         { background: #94a3b8; color: #fff; }
+  .modal-status.olympia       { background: #dbeafe; color: #1d4ed8; }
+
+  .modal-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+
+  /* 入庫フォーム */
+  .receive-form {
+    margin-top: 16px;
+    border-top: 1px solid #e5e7eb;
+    padding-top: 16px;
+  }
+
+  .receive-form h4 {
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 12px;
+    color: #334155;
+  }
+
+  .form-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+
+  .form-row label {
+    width: 90px;
+    min-width: 90px;
+    font-size: 12px;
+    color: #64748b;
+    padding-top: 8px;
+  }
+
+  .form-row input[type=text],
+  .form-row input[type=date] {
+    flex: 1;
+    padding: 7px 10px;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    font-size: 13px;
+    outline: none;
+    transition: border-color .2s;
+  }
+
+  .form-row input:focus { border-color: #3b82f6; }
+  .form-row input[readonly] { background: #f8fafc; color: #475569; }
+
+  .check-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #475569;
+    padding-top: 0 !important;
+    cursor: pointer;
+  }
+
+  /* 検索ドロップダウン */
+  .search-wrap { flex: 1; position: relative; }
+
+  .search-dropdown {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background: #fff;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0,0,0,.12);
+    z-index: 300;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+
+  .search-item {
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 12px;
+    border-bottom: 1px solid #f1f5f9;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .search-item:hover { background: #f0f9ff; }
+  .search-item.no-result { color: #94a3b8; cursor: default; }
+  .search-partno { font-weight: 700; color: #1e293b; }
+  .search-spec   { color: #64748b; }
+
+  /* 品目テーブル */
+  .item-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+
+  .item-table th, .item-table td {
+    padding: 6px 8px;
+    border: 1px solid #e5e7eb;
+    text-align: left;
+  }
+
+  .item-table th { background: #f8fafc; font-weight: 600; color: #475569; }
+
+  /* 履歴テーブル */
+  .history-table-wrap { overflow-x: auto; margin-top: 12px; }
+
+  .history-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  .history-table th, .history-table td {
+    padding: 7px 10px;
+    border: 1px solid #e5e7eb;
+    text-align: left;
+    white-space: nowrap;
+  }
+
+  .history-table th { background: #f8fafc; font-weight: 600; color: #475569; }
+  .history-table tr:nth-child(even) td { background: #f8fafc; }
+
+  .empty-note, .full-note {
+    font-size: 13px;
+    color: #94a3b8;
+    padding: 8px 0;
+  }
+
+  /* ===== 棚卸画面 ===== */
+  #stocktake-screen { display: none; }
+
+  .stocktake-header {
+    background: #065f46;
+    color: #fff;
+    padding: 0 16px;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .stocktake-header h2 { font-size: 15px; font-weight: 700; }
+
+  .stocktake-progress {
+    background: #fff;
+    border-bottom: 1px solid #e5e7eb;
+    padding: 10px 16px;
+    position: sticky;
+    top: 52px;
+    z-index: 99;
+  }
+
+  .progress-bar-wrap {
+    background: #e5e7eb;
+    border-radius: 99px;
+    height: 8px;
+    margin-top: 6px;
+    overflow: hidden;
+  }
+
+  .progress-bar {
+    background: #10b981;
+    height: 100%;
+    border-radius: 99px;
+    transition: width .3s;
+  }
+
+  .progress-text {
+    font-size: 13px;
+    color: #334155;
+    font-weight: 600;
+  }
+
+  .stocktake-list { padding: 12px 16px; }
+
+  .stocktake-item {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    margin-bottom: 10px;
+    overflow: hidden;
+    transition: border-color .2s;
+  }
+
+  .stocktake-item.done { border-color: #10b981; background: #f0fdf4; }
+
+  .stocktake-item-header {
+    display: flex;
+    align-items: center;
+    padding: 12px 14px;
+    gap: 10px;
+    cursor: pointer;
+  }
+
+  .stocktake-loc {
+    font-size: 15px;
+    font-weight: 700;
+    color: #1e293b;
+    min-width: 60px;
+  }
+
+  .stocktake-summary {
+    flex: 1;
+    font-size: 12px;
+    color: #64748b;
+  }
+
+  .stocktake-check {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 2px solid #cbd5e1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    color: #10b981;
+    background: #fff;
+    flex-shrink: 0;
+  }
+
+  .stocktake-item.done .stocktake-check {
+    background: #10b981;
+    border-color: #10b981;
+    color: #fff;
+  }
+
+  .stocktake-item-body {
+    display: none;
+    padding: 0 14px 14px;
+    border-top: 1px solid #f1f5f9;
+  }
+
+  .stocktake-item.open .stocktake-item-body { display: block; }
+
+  .st-current-items {
+    font-size: 12px;
+    margin-bottom: 10px;
+  }
+
+  .st-current-items table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .st-current-items th, .st-current-items td {
+    padding: 5px 7px;
+    border: 1px solid #e5e7eb;
+    font-size: 11px;
+  }
+
+  .st-current-items th { background: #f8fafc; }
+
+  .st-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  /* スマホ対応 */
+  @media (max-width: 600px) {
+    .app-header h1 { font-size: 14px; }
+    .main-content { padding: 12px; }
+    .modal-box { padding: 16px; }
+    .form-row { flex-direction: column; gap: 4px; }
+    .form-row label { width: auto; padding-top: 0; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ===== ログイン画面 ===== -->
+<div id="login-screen">
+  <div class="login-box">
+    <h1>自動倉庫管理システム</h1>
+    <p>ログインしてください</p>
+    <input id="login-email" type="email" placeholder="ID（メールアドレス形式）">
+    <input id="login-pass"  type="password" placeholder="パスワード">
+    <div class="login-error" id="login-error"></div>
+    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">ログイン</button>
+  </div>
+</div>
+
+<!-- ===== アプリ画面 ===== -->
+<div id="app-screen">
+  <header class="app-header">
+    <h1>自動倉庫管理システム</h1>
+    <div class="header-actions">
+      <!-- PC: ボタンを横並び表示 -->
+      <div class="header-btns-pc">
+        <button class="btn btn-outline" style="color:#fff;border-color:#475569" onclick="openStockSearch()">在庫検索/出庫処理</button>
+        <button class="btn btn-outline" style="color:#fff;border-color:#475569" onclick="openHistory()">入出庫履歴</button>
+        <button class="btn btn-outline" style="color:#fff;border-color:#475569" onclick="openStocktake()">棚卸</button>
+        <button class="btn btn-outline" style="color:#fff;border-color:#475569" onclick="openMasterModal()">品目マスタ</button>
+        <button class="btn btn-outline" style="color:#fff;border-color:#475569" onclick="exportCSV()">CSVエクスポート</button>
+        <button class="btn btn-outline" style="color:#fff;border-color:#475569" onclick="createSnapshot()">復元ポイント作成</button>
+        <button class="btn btn-outline" style="color:#fff;border-color:#475569" onclick="doLogout()">ログアウト</button>
+      </div>
+      <!-- スマホ: ハンバーガーメニュー -->
+      <button class="hamburger-btn" onclick="toggleHamburger()" id="hamburger-btn">☰</button>
+    </div>
+    <!-- ハンバーガードロップダウン -->
+    <div class="hamburger-menu" id="hamburger-menu">
+      <button onclick="openStockSearch();closeHamburger()">在庫検索/出庫処理</button>
+      <button onclick="openHistory();closeHamburger()">入出庫履歴</button>
+      <button onclick="openStocktake();closeHamburger()">棚卸</button>
+      <button onclick="openMasterModal();closeHamburger()">品目マスタ</button>
+      <button onclick="exportCSV();closeHamburger()">CSVエクスポート</button>
+      <button onclick="createSnapshot();closeHamburger()">復元ポイント作成</button>
+      <button onclick="doLogout()">ログアウト</button>
+    </div>
+  </header>
+
+  <main class="main-content">
+
+    <!-- 凡例 -->
+    <div class="legend">
+      <div class="legend-item">
+        <div class="legend-box" style="background:#e2e8f0;border-color:#cbd5e1"></div>
+        <span>管理外（空き）</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-box" style="background:#94a3b8;border-color:#64748b"></div>
+        <span>管理外（使用中）</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-box" style="background:#dbeafe;border-color:#93c5fd"></div>
+        <span>置場・空</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-box" style="background:#fef08a;border-color:#facc15"></div>
+        <span>置場・1個</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-box" style="background:#fca5a5;border-color:#f87171"></div>
+        <span>置場・満</span>
+      </div>
+    </div>
+
+    <!-- 1号機 -->
+    <div class="machine-section">
+      <div class="machine-title">1号機</div>
+      <div class="grid-wrap">
+        <div id="grid-1"></div>
+      </div>
+    </div>
+
+    <!-- 2号機 -->
+    <div class="machine-section">
+      <div class="machine-title">2号機</div>
+      <div class="grid-wrap">
+        <div id="grid-2"></div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- ===== 棚卸画面 ===== -->
+<div id="stocktake-screen">
+  <header class="stocktake-header">
+    <h2>棚卸モード</h2>
+    <button class="btn btn-outline" style="color:#fff;border-color:#065f46;font-size:12px" onclick="closeStocktake()">← 棚卸を終了</button>
+  </header>
+  <div class="stocktake-progress">
+    <div class="progress-text" id="st-progress-text">読み込み中...</div>
+    <div class="progress-bar-wrap">
+      <div class="progress-bar" id="st-progress-bar" style="width:0%"></div>
+    </div>
+  </div>
+  <div class="stocktake-list" id="stocktake-list"></div>
+</div>
+
+<!-- ===== ロケ詳細モーダル ===== -->
+<div class="modal-overlay" id="loc-modal">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h3 id="loc-modal-title"></h3>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div id="loc-modal-body"></div>
+  </div>
+</div>
+
+<!-- ===== 出庫モーダル ===== -->
+<div class="modal-overlay" id="shipout-modal">
+  <div class="modal-box" style="max-width:380px">
+    <div class="modal-header">
+      <h3>出庫登録</h3>
+      <button class="modal-close" onclick="closeShipOutModal()">×</button>
+    </div>
+    <input type="hidden" id="shipout-loc-id">
+    <input type="hidden" id="shipout-idx">
+    <div class="form-row" style="margin-bottom:16px">
+      <label style="white-space:nowrap">使用番号・備考</label>
+      <input id="shipout-memo" type="text" placeholder="例: 240001（任意）"
+        style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-danger" onclick="doShipOut()">出庫する</button>
+      <button class="btn btn-secondary" onclick="closeShipOutModal()">キャンセル</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 履歴モーダル ===== -->
+<div class="modal-overlay" id="history-modal">
+  <div class="modal-box" style="max-width:800px">
+    <div class="modal-header">
+      <h3>入出庫履歴</h3>
+      <button class="modal-close" onclick="closeHistory()">×</button>
+    </div>
+    <div class="history-table-wrap">
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>区分</th>
+            <th>ロケ</th>
+            <th>部品番号</th>
+            <th>型式・仕様</th>
+            <th>製造番号</th>
+            <th>日付</th>
+            <th>備考</th>
+          </tr>
+        </thead>
+        <tbody id="history-body">
+          <tr><td colspan="6">読み込み中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 品目マスタモーダル ===== -->
+<div class="modal-overlay" id="master-modal">
+  <div class="modal-box" style="max-width:700px">
+    <div class="modal-header">
+      <h3>品目マスタ管理</h3>
+      <button class="modal-close" onclick="closeMasterModal()">×</button>
+    </div>
+
+    <!-- インポートエリア -->
+    <div id="master-import-area">
+      <p style="font-size:13px;color:#475569;margin-bottom:12px">
+        Excelファイル（.xlsx）を選択してインポートしてください。<br>
+        ※列構成：1列目＝品目番号、2列目＝型式・仕様
+      </p>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+        <input type="file" id="master-file" accept=".xlsx" style="font-size:13px">
+        <button class="btn btn-primary" onclick="importMaster()">インポート</button>
+      </div>
+      <div id="master-import-msg" style="font-size:13px;min-height:20px"></div>
+    </div>
+
+    <hr style="margin:16px 0;border:none;border-top:1px solid #e5e7eb">
+
+    <!-- 現在のマスタ一覧 -->
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <span style="font-size:13px;font-weight:600;color:#334155">現在の登録件数：<span id="master-count">-</span>件</span>
+      <input type="text" id="master-filter" placeholder="絞り込み検索..." oninput="filterMasterTable()"
+        style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:12px;width:200px">
+    </div>
+    <div style="max-height:340px;overflow-y:auto;border:1px solid #e5e7eb;border-radius:6px">
+      <table class="history-table" style="width:100%">
+        <thead>
+          <tr><th>品目番号</th><th>型式・仕様</th><th>操作</th></tr>
+        </thead>
+        <tbody id="master-table-body">
+          <tr><td colspan="3" style="text-align:center;color:#94a3b8">読み込み中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 1件追加フォーム -->
+    <div style="margin-top:16px;border-top:1px solid #e5e7eb;padding-top:16px">
+      <h4 style="font-size:13px;font-weight:700;color:#334155;margin-bottom:10px">1件追加</h4>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input id="add-partno" type="text" placeholder="品目番号"
+          style="padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;width:140px">
+        <input id="add-spec" type="text" placeholder="型式・仕様"
+          style="padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;flex:1;min-width:200px">
+        <button class="btn btn-primary" onclick="addMasterItem()">追加</button>
+      </div>
+      <div id="add-master-msg" style="font-size:12px;min-height:18px;margin-top:6px"></div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+  // SheetJS（Excelファイル読み込み用）
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<script type="module">
+  import { initializeApp, getApps } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, doc, setDoc, getDocs, collection, deleteDoc, writeBatch }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyA33aqmYVplQE77FVpbXgZPFH27jyx2SvE",
+    authDomain: "jidou-souko.firebaseapp.com",
+    projectId: "jidou-souko",
+    storageBucket: "jidou-souko.firebasestorage.app",
+    messagingSenderId: "764306513933",
+    appId: "1:764306513933:web:7294dd6f2b3571165c7544"
+  };
+
+  const app2 = getApps().find(a => a.name === '[DEFAULT]') ||
+               initializeApp(firebaseConfig);
+  const db2 = getFirestore(app2);
+
+  let masterCache = [];
+
+  // ===== モーダル開閉 =====
+  window.openMasterModal = async () => {
+    document.getElementById('master-modal').style.display = 'flex';
+    await refreshMasterTable();
+  };
+
+  window.closeMasterModal = () => {
+    document.getElementById('master-modal').style.display = 'none';
+  };
+
+  document.getElementById('master-modal').addEventListener('click', e => {
+    if (e.target === e.currentTarget) window.closeMasterModal();
+  });
+
+  // ===== マスタ一覧表示 =====
+  async function refreshMasterTable() {
+    const snap = await getDocs(collection(db2, 'itemMaster'));
+    masterCache = [];
+    snap.forEach(d => masterCache.push({ id: d.id, ...d.data() }));
+    masterCache.sort((a, b) => a.id.localeCompare(b.id));
+    document.getElementById('master-count').textContent = masterCache.length;
+    renderMasterTable(masterCache);
+
+    // メインアプリのitemMasterも更新
+    if (window._refreshItemMaster) window._refreshItemMaster(masterCache);
+  }
+
+  function renderMasterTable(items) {
+    const tbody = document.getElementById('master-table-body');
+    if (items.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:#94a3b8">登録なし</td></tr>';
+      return;
+    }
+    tbody.innerHTML = items.map(item => `
+      <tr>
+        <td style="white-space:nowrap">${item.id}</td>
+        <td>${item.spec || ''}</td>
+        <td><button class="btn btn-danger btn-sm" onclick="deleteMasterItem('${item.id}')">削除</button></td>
+      </tr>
+    `).join('');
+  }
+
+  window.filterMasterTable = () => {
+    const q = document.getElementById('master-filter').value.toLowerCase();
+    const filtered = masterCache.filter(item =>
+      item.id.toLowerCase().includes(q) || (item.spec || '').toLowerCase().includes(q)
+    );
+    renderMasterTable(filtered);
+  };
+
+  // ===== Excelインポート =====
+  window.importMaster = async () => {
+    const file = document.getElementById('master-file').files[0];
+    const msg  = document.getElementById('master-import-msg');
+    if (!file) { msg.style.color = '#ef4444'; msg.textContent = 'ファイルを選択してください'; return; }
+
+    msg.style.color = '#64748b';
+    msg.textContent = '読み込み中...';
+
+    try {
+      const data = await file.arrayBuffer();
+      const wb = XLSX.read(data, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+
+      // 1行目がヘッダーかどうか判定（品目番号っぽくなければスキップ）
+      let startRow = 0;
+      if (rows[0] && typeof rows[0][0] === 'string' && rows[0][0].includes('品目')) startRow = 1;
+
+      const items = [];
+      for (let i = startRow; i < rows.length; i++) {
+        const partNo = String(rows[i][0] || '').trim();
+        const spec   = String(rows[i][1] || '').trim();
+        if (partNo) items.push({ partNo, spec });
+      }
+
+      if (items.length === 0) {
+        msg.style.color = '#ef4444';
+        msg.textContent = 'データが見つかりませんでした。列構成を確認してください。';
+        return;
+      }
+
+      if (!confirm(`${items.length}件をインポートします。既存データは上書きされます。よろしいですか？`)) return;
+
+      msg.textContent = `登録中... (0/${items.length})`;
+
+      // Firestoreはbatchが500件までなので分割
+      let count = 0;
+      const CHUNK = 400;
+      for (let i = 0; i < items.length; i += CHUNK) {
+        const batch = writeBatch(db2);
+        items.slice(i, i + CHUNK).forEach(item => {
+          batch.set(doc(db2, 'itemMaster', item.partNo), { spec: item.spec });
+        });
+        await batch.commit();
+        count += Math.min(CHUNK, items.length - i);
+        msg.textContent = `登録中... (${count}/${items.length})`;
+      }
+
+      msg.style.color = '#16a34a';
+      msg.textContent = `✓ ${items.length}件のインポートが完了しました`;
+      document.getElementById('master-file').value = '';
+      await refreshMasterTable();
+
+    } catch(e) {
+      msg.style.color = '#ef4444';
+      msg.textContent = 'エラーが発生しました: ' + e.message;
+    }
+  };
+
+  // ===== 1件追加 =====
+  window.addMasterItem = async () => {
+    const partNo = document.getElementById('add-partno').value.trim();
+    const spec   = document.getElementById('add-spec').value.trim();
+    const msg    = document.getElementById('add-master-msg');
+    if (!partNo) { msg.style.color = '#ef4444'; msg.textContent = '品目番号を入力してください'; return; }
+
+    await setDoc(doc(db2, 'itemMaster', partNo), { spec });
+    msg.style.color = '#16a34a';
+    msg.textContent = `✓ ${partNo} を追加しました`;
+    document.getElementById('add-partno').value = '';
+    document.getElementById('add-spec').value = '';
+    await refreshMasterTable();
+  };
+
+  // ===== 1件削除 =====
+  window.deleteMasterItem = async (partNo) => {
+    if (!confirm(`「${partNo}」を削除しますか？`)) return;
+    await deleteDoc(doc(db2, 'itemMaster', partNo));
+    await refreshMasterTable();
+  };
+
+  // メインアプリからitemMasterを参照できるようにフック
+  window._refreshItemMaster = (items) => {
+    // メインスクリプトのitemMasterを更新
+    if (window.__setItemMaster) window.__setItemMaster(items);
+  };
+</script>
+
+
+<!-- ===== 在庫検索スクリプト ===== -->
+<script>
+window.openStockSearch = () => {
+  // リセット
+  ['sk-series','sk-sub','sk-voltage','sk-freq','sk-fuel','sk-special'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+  document.getElementById('sk-sub').disabled = true;
+  document.getElementById('sk-sub').innerHTML = '<option value="">-- ①を先に選択 --</option>';
+  document.getElementById('sk-result-body').innerHTML =
+    '<tr><td colspan="6" style="text-align:center;color:#94a3b8">条件を選択してください</td></tr>';
+  document.getElementById('sk-result-count').textContent = '条件を選択してください';
+  document.getElementById('stock-search-modal').style.display = 'flex';
+};
+
+window.closeStockSearch = () => {
+  document.getElementById('stock-search-modal').style.display = 'none';
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('stock-search-modal').addEventListener('click', e => {
+    if (e.target === e.currentTarget) closeStockSearch();
+  });
+});
+
+window.onSkSeriesChange = () => {
+  const series = document.getElementById('sk-series').value;
+  const subSel = document.getElementById('sk-sub');
+  subSel.innerHTML = '<option value="">-- 指定なし --</option>';
+  if (series && SUB_OPTIONS[series] && SUB_OPTIONS[series].length > 0) {
+    SUB_OPTIONS[series].forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s;
+      opt.textContent = series === 'OM2N' ? s : series + '-' + s;
+      subSel.appendChild(opt);
+    });
+    subSel.disabled = false;
+  } else {
+    subSel.disabled = true;
+  }
+  onSkFilterChange();
+};
+
+window.onSkFilterChange = () => {
+  const series  = document.getElementById('sk-series').value;
+  const sub     = document.getElementById('sk-sub').value;
+  const voltage = document.getElementById('sk-voltage').value;
+  const freq    = document.getElementById('sk-freq').value;
+  const fuel    = document.getElementById('sk-fuel').value;
+  const special = document.getElementById('sk-special').value;
+  const body    = document.getElementById('sk-result-body');
+  const count   = document.getElementById('sk-result-count');
+
+  if (!series) {
+    count.textContent = 'シリーズを選択してください';
+    body.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8">①シリーズを選択してください</td></tr>';
+    return;
+  }
+
+  // 条件に合う品目番号を絞り込む
+  const matchedPartNos = new Set(
+    Object.entries(SPEC_MASTER)
+      .filter(([partno, data]) => {
+        if (data.series !== series) return false;
+        if (sub     && data.sub     !== sub)     return false;
+        if (voltage && data.voltage !== voltage && data.voltage !== '両方') return false;
+        if (freq    && data.freq    !== freq    && data.freq    !== '両方') return false;
+        if (fuel    && data.fuel    !== fuel)    return false;
+        if (!special && data.special) return false;
+        if (special && data.special !== special) return false;
+        return true;
+      })
+      .map(([partno]) => partno)
+  );
+
+  if (matchedPartNos.size === 0) {
+    count.textContent = '0件';
+    body.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8">該当する品目なし</td></tr>';
+    return;
+  }
+
+  // locationsDataから在庫を検索
+  const results = [];
+  const _locs = window.__getLocationsData ? window.__getLocationsData() : {};
+  for (const [locId, loc] of Object.entries(_locs)) {
+    if (loc.type !== 'olympia') continue;
+    for (let idx = 0; idx < (loc.items || []).length; idx++) {
+      const item = loc.items[idx];
+      if (matchedPartNos.has(item.partNo)) {
+        results.push({ locId, idx, item });
+      }
+    }
+  }
+
+  // 入庫日の古い順にソート
+  results.sort((a, b) => {
+    const da = a.item.inDate || '';
+    const db2 = b.item.inDate || '';
+    return da.localeCompare(db2);
+  });
+
+  count.textContent = `${results.length}件（入庫日が古い順）`;
+
+  if (results.length === 0) {
+    body.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8">在庫なし</td></tr>';
+    return;
+  }
+
+  body.innerHTML = results.map(({ locId, idx, item }) => `
+    <tr style="cursor:pointer" onclick="goToLoc('${locId}')" title="${item.spec || ''}">
+      <td style="font-weight:700;white-space:nowrap">${locId}</td>
+      <td style="white-space:nowrap">${item.partNo || ''}</td>
+      <td style="font-size:11px;white-space:nowrap">${extractTypeVoltage(item.spec || '')}</td>
+      <td style="white-space:nowrap">${item.serialNo || ''}</td>
+      <td style="white-space:nowrap;${isOld(item.inDate) ? 'color:#ef4444;font-weight:700' : ''}">${item.inDate || ''}</td>
+      <td style="white-space:nowrap"><button class="btn btn-primary btn-sm" onclick="event.stopPropagation();goToLoc('${locId}')">開く</button></td>
+    </tr>
+  `).join('');
+};
+
+function extractTypeVoltage(spec) {
+  if (!spec) return '';
+  // 「〇〇バーナ 」のプレフィックスを除去
+  const s = spec.replace(/^.*?バーナ\s+/, '');
+  // 電圧（100V/200V）の前までを型式として取得
+  const m = s.match(/^(.+?)\s+(\d+V)/);
+  if (m) return m[1].trim() + ' ' + m[2];
+  // 電圧がない場合は最初のスペースか全角スペースまで
+  return s.split(/[ \u3000]/)[0];
+}
+
+function isOld(inDate) {
+  if (!inDate) return false;
+  // 2年以上前なら古いとみなして赤表示
+  try {
+    const parts = inDate.split('/');
+    if (parts.length < 2) return false;
+    const year = parts[0].length === 2 ? 2000 + parseInt(parts[0]) : parseInt(parts[0]);
+    const month = parseInt(parts[1]);
+    const d = new Date(year, month - 1, 1);
+    const now = new Date();
+    return (now - d) > (2 * 365 * 24 * 60 * 60 * 1000);
+  } catch(e) { return false; }
+}
+
+window.goToLoc = (locId) => {
+  closeStockSearch();
+  openLocModal(locId);
+};
+</script>
+
+<!-- ===== 絞り込み検索スクリプト ===== -->
+<script>
+// 構造化品目マスタ
+const SPEC_MASTER = {"302030A0": {"spec": "オイルバーナ FL25 FL A重油/200V/50Hz", "series": "その他", "sub": "", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "302040A0": {"spec": "オイルバーナ FL25 FL A重油/200V/60Hz", "series": "その他", "sub": "", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "302050A0": {"spec": "オイルバーナ FL25 FL 灯油/200V/50Hz", "series": "その他", "sub": "", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "302060A0": {"spec": "オイルバーナ FL25 FL 灯油/200V/60Hz", "series": "その他", "sub": "", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "302070A0": {"spec": "オイルバーナ LT-F271･5AP LTP A重油 200V", "series": "その他", "sub": "", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "302080A0": {"spec": "廃油オイルバーナ OTU-51･6 OUT 200V", "series": "その他", "sub": "", "voltage": "200V", "freq": "60Hz", "fuel": "廃油", "special": ""}, "BLTP001": {"spec": "オイルバーナ BLT-62・5WKP-1 200V　50Hz　灯油　天然塩釜用　ﾌｫﾄﾀﾞｲｵｰﾄﾞ", "series": "BLT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": "天然塩釜用"}, "BLTP002": {"spec": "オイルバーナ BLT-62・6WKP-1 200V　60Hz　灯油　天然塩釜用　ﾌｫﾄﾀﾞｲｵｰﾄﾞ", "series": "BLT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": "天然塩釜用"}, "BLTP003": {"spec": "オイルバーナ BLT-62・5WKP-2 200V　50Hz　灯油　天然塩釜用　ﾌｫﾄﾀﾞｲｵｰﾄﾞ", "series": "BLT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": "天然塩釜用"}, "BLTP004": {"spec": "オイルバーナ BLT-62・6WKP-2 200V　60Hz　灯油　天然塩釜用　ﾌｫﾄﾀﾞｲｵｰﾄﾞ", "series": "BLT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": "天然塩釜用"}, "FL00009": {"spec": "オイルバーナ 低NOx仕様 FL-40A-N-V7 840　Ａ重油", "series": "FL", "sub": "40", "voltage": "", "freq": "", "fuel": "", "special": "低NOx仕様"}, "FLP0001": {"spec": "オイルバーナ FL-25AP50-V7　A/50Hz 825 200V 50Hz A重油 FD仕様", "series": "FL", "sub": "25", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "FLP0002": {"spec": "オイルバーナ FL-25AP60-V7　A/60Hz 825 200V 60Hz A重油 FD仕様", "series": "FL", "sub": "25", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "FLP0003": {"spec": "オイルバーナ FL-25KP50-V7　K/50Hz 825 200V 50Hz 灯油 FD仕様", "series": "FL", "sub": "25", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "FLP0004": {"spec": "オイルバーナ FL-25KP60-V7　K/60Hz 825 200V 60Hz 灯油 FD仕様", "series": "FL", "sub": "25", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "FLP0005": {"spec": "オイルバーナ FL-40AP-V7 A重油 ", "series": "FL", "sub": "40", "voltage": "", "freq": "", "fuel": "A重油", "special": ""}, "FLP0006": {"spec": "オイルバーナ FL-40KP-V7 灯油 ", "series": "FL", "sub": "40", "voltage": "", "freq": "", "fuel": "灯油", "special": ""}, "FLP0007": {"spec": "オイルバーナ FL-60AP-V4バーナ FL-60AP-V4 A重油 ", "series": "FL", "sub": "60", "voltage": "", "freq": "60Hz", "fuel": "A重油", "special": ""}, "FLP0008": {"spec": "オイルバーナ FL-60KP-V4バーナ FL-60KP-V4 灯油 ", "series": "FL", "sub": "60", "voltage": "", "freq": "60Hz", "fuel": "灯油", "special": ""}, "FLP0009": {"spec": "オイルバーナ FL-40KP-V7-A　灯油 840 200V 灯油 IE3モータへ変更", "series": "FL", "sub": "40", "voltage": "200V", "freq": "", "fuel": "灯油", "special": ""}, "FLP0010": {"spec": "オイルバーナ FL-40AP-V7-A　A重油 840 200V A重油 IE3モータへ変更", "series": "FL", "sub": "40", "voltage": "200V", "freq": "", "fuel": "A重油", "special": ""}, "FLP0011": {"spec": "オイルバーナ FL-60AP-V4-A　A重油 860　A重油", "series": "FL", "sub": "60", "voltage": "", "freq": "60Hz", "fuel": "A重油", "special": ""}, "FLP0012": {"spec": "オイルバーナ FL-60KP-V4-A　灯油 860　灯油", "series": "FL", "sub": "60", "voltage": "", "freq": "60Hz", "fuel": "灯油", "special": ""}, "FLP0013": {"spec": "オイルバーナ FL-40KP-V7-B　灯油 840 200V 灯油", "series": "FL", "sub": "40", "voltage": "200V", "freq": "", "fuel": "灯油", "special": ""}, "FLP0014": {"spec": "オイルバーナ FL-40AP-V7-B　A重油 840 200V A重油", "series": "FL", "sub": "40", "voltage": "200V", "freq": "", "fuel": "A重油", "special": ""}, "FLP0015": {"spec": "オイルバーナ 低NOx仕様 FL-40A-N-V7 840　灯油", "series": "FL", "sub": "40", "voltage": "", "freq": "", "fuel": "灯油", "special": "低NOx仕様"}, "LTFP001": {"spec": "オイルバーナ LT-F271.5AP CH-1160L 200V 50Hz A重油", "series": "LTF", "sub": "", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "LTNP001": {"spec": "オイルバーナ LTN-120･5AP-1 200V 148　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "LTNP002": {"spec": "オイルバーナ LTN-120･6AP-1 200V 148　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "LTNP003": {"spec": "オイルバーナ LTN-120･5KP-1 200V 148　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "LTNP004": {"spec": "オイルバーナ LTN-120･6KP-1 200V 148　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTNP005": {"spec": "オイルバーナ LTN-120･5AP-2 200V 160　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "LTNP006": {"spec": "オイルバーナ LTN-120･6AP-2 200V 160　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "LTNP007": {"spec": "オイルバーナ LTN-120･5KP-2 200V 160　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "LTNP008": {"spec": "オイルバーナ LTN-120･6KP-2 200V 160　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTNP009": {"spec": "オイルバーナ 国土交通省仕様 LTN-120･6KP-1 200V ", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "60Hz", "fuel": "", "special": "国土交通省仕様"}, "LTNP011": {"spec": "オイルバーナ LTN-200･5AP 200V 1100　50Hz　A重油", "series": "LTN", "sub": "200", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "LTNP012": {"spec": "オイルバーナ LTN-200･6AP 200V 1100　60Hz　A重油", "series": "LTN", "sub": "200", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "LTNP013": {"spec": "オイルバーナ LTN-200･5KP 200V 1100　50Hz　灯油", "series": "LTN", "sub": "200", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "LTNP014": {"spec": "オイルバーナ LTN-200･6KP 200V 1100　60Hz　灯油", "series": "LTN", "sub": "200", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTNP015": {"spec": "オイルバーナ LTN-150･5AP 200V 180　50Hz　A重油", "series": "LTN", "sub": "150", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "LTNP016": {"spec": "オイルバーナ LTN-150･6AP 200V 180　60Hz　A重油", "series": "LTN", "sub": "150", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "LTNP017": {"spec": "オイルバーナ LTN-150･5KP 200V 180　50Hz　灯油", "series": "LTN", "sub": "150", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "LTNP018": {"spec": "オイルバーナ LTN-150･6KP 200V 180　60Hz　灯油", "series": "LTN", "sub": "150", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTNP020": {"spec": "オイルバーナ LTN-120･6ADP-2 ", "series": "LTN", "sub": "120", "voltage": "", "freq": "60Hz", "fuel": "", "special": ""}, "LTNP021": {"spec": "オイルバーナ 国土交通省仕様 LTN-120･6AP-1 148　A　200V　60Hz", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "60Hz", "fuel": "", "special": "国土交通省仕様"}, "LTNP022": {"spec": "オイルバーナ 国土交通省仕様 LTN-120･5AP-1 ", "series": "LTN", "sub": "120", "voltage": "", "freq": "50Hz", "fuel": "", "special": "国土交通省仕様"}, "LTNP023": {"spec": "オイルバーナ 国土交通省仕様 LTN-120･5AP-2 ", "series": "LTN", "sub": "120", "voltage": "", "freq": "50Hz", "fuel": "", "special": "国土交通省仕様"}, "LTNP024": {"spec": "オイルバーナ 国土交通省仕様 LTN-120･5KP-2 ", "series": "LTN", "sub": "120", "voltage": "", "freq": "50Hz", "fuel": "", "special": "国土交通省仕様"}, "LTNP025": {"spec": "オイルバーナ LTN-120･5AP-1 150 200V 50Hz A重油", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "LTNP026": {"spec": "オイルバーナ(163用) LTN-120･6KP-2 200V 163　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTNP027": {"spec": "オイルバーナ 国土交通省仕様 LTN-120･5KP-1　200V 148　50Hz　灯油", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": "国土交通省仕様"}, "LTNP028": {"spec": "オイルバーナ LTN-120･6KP-1 150　200V　60Hz　灯油", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTNP029": {"spec": "オイルバーナ LTN-120･6AP-1 150　200V　60Hz　A重油", "series": "LTN", "sub": "120", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "LTP0001": {"spec": "オイルバーナ LT-62･5WAP-1 200V 125　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "LTP0002": {"spec": "オイルバーナ LT-62･5WAP-2 200V 130　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "LTP0003": {"spec": "オイルバーナ LT-62･5WKP-1 200V 125　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTP0004": {"spec": "オイルバーナ LT-62･5WKP-2 200V 130　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTP0005": {"spec": "オイルバーナ LT-62･6WAP-1 200V 125　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "LTP0006": {"spec": "オイルバーナ LT-62･6WAP-2 200V 130　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "LTP0007": {"spec": "オイルバーナ LT-62･6WKP-1 200V 125　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTP0008": {"spec": "オイルバーナ LT-62･6WKP-2 200V 130　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTP0009": {"spec": "オイルバーナ LT-81･5AP-1 200V 137　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "81", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "LTP0010": {"spec": "オイルバーナ LT-81･5KP-1 200V 137　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "81", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "LTP0011": {"spec": "オイルバーナ LT-81･6AP-1 200V 137　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "81", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "LTP0012": {"spec": "オイルバーナ LT-81･6KP-1 200V 137　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "81", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTP0017": {"spec": "オイルバーナ 国土交通省 LT-62･5WKP-2 130 200V 50Hｚ 灯油", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": "国土交通省仕様"}, "LTP0018": {"spec": "オイルバーナ 国土交通省 LT-62･6WKP-1 125 200V 60Hz 灯油", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": "国土交通省仕様"}, "LTP0019": {"spec": "オイルバーナ LT-81･5AP-2 200V 140　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "81", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "LTP0020": {"spec": "オイルバーナ LT-81･6AP-2 200V 140　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "81", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "LTP0021": {"spec": "オイルバーナ LT-81･5KP-2 200V 140　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "81", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "LTP0022": {"spec": "オイルバーナ LT-81･6KP-2 200V 140　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "81", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "LTP0023": {"spec": "オイルバーナ 国土交通省仕様 LT-81･6KP-2 ", "series": "LT", "sub": "81", "voltage": "", "freq": "60Hz", "fuel": "", "special": "国土交通省仕様"}, "LTP0024": {"spec": "オイルバーナ 国土交通省仕様 LT-62･6WAP-2 200V 130 200V 60Hz A重油", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": "国土交通省仕様"}, "LTP0025": {"spec": "オイルバーナ 特 LT-62･6WKP-1CX(BCR装備 ", "series": "LT", "sub": "62", "voltage": "", "freq": "60Hz", "fuel": "", "special": "特殊"}, "LTP0026": {"spec": "オイルバーナ 国土交通省仕様 LT-62･6WKP-2 130 200V 60Hz 灯油", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": "国土交通省仕様"}, "LTP0027": {"spec": "オイルバーナ 国土交通省仕様 LT-62･5WKP-2 130 200V 50Hz 灯油", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": "国土交通省仕様"}, "LTP0028": {"spec": "オイルバーナ 国土交通省仕様 LT-81･6KP-1 137 200V 60Hz 灯油", "series": "LT", "sub": "81", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": "国土交通省仕様"}, "LTP0029": {"spec": "オイルバーナ 特 LT-62･6WAP-1 200V 125 200V 60Hz A重油", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": "特殊"}, "LTP0030": {"spec": "オイルバーナ 国土交通省 LT-81･6AP-1 137 200V 60Hz A重油", "series": "LT", "sub": "81", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": "国土交通省仕様"}, "LTP0031": {"spec": "オイルバーナ 国土交通省 LT-81･5KP-1 137 200V 50Hz 灯油", "series": "LT", "sub": "81", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": "国土交通省仕様"}, "LTP0032": {"spec": "オイルバーナ 特 LT-62･6WBXP-2 BDF 図1 ", "series": "LT", "sub": "62", "voltage": "", "freq": "60Hz", "fuel": "BDF", "special": "BDF仕様"}, "LTP0033": {"spec": "オイルバーナ 国土交通省仕様 LT-62･5WAP-1 200V 125　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": "国土交通省仕様"}, "LTP0034": {"spec": "オイルバーナ 国土交通省仕様 LT-62･5WAP-2 130 200V 50Hz A重油", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": "国土交通省仕様"}, "LTP0035": {"spec": "オイルバーナ トンネル仕様 LT-62・5WAP-1 125 200V 50Hz A重油 ボックス加工", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": "トンネル仕様"}, "LTP0036": {"spec": "オイルバーナ 特殊 LT-62･5WBP-1 200V　50Hz　BDF", "series": "LT", "sub": "62", "voltage": "200V", "freq": "60Hz", "fuel": "BDF", "special": "BDF仕様"}, "LTP0037": {"spec": "オイルバーナ LT-81･6AP-2 200V 140　200V　60Hz　A重油　国土交通省仕様", "series": "LT", "sub": "81", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": "国土交通省仕様"}, "OM2N001": {"spec": "オイルバーナ OM2N-V1WSP1 AC100V ", "series": "OM2N", "sub": "OM2N-V1", "voltage": "100V", "freq": "", "fuel": "", "special": ""}, "OM2N002": {"spec": "オイルバーナ OM2N-V1WSP2 AC200V ", "series": "OM2N", "sub": "OM2N-V1", "voltage": "200V", "freq": "", "fuel": "", "special": ""}, "OM2N003": {"spec": "オイルバーナ OM2N-V6WSP1 AC100V ", "series": "OM2N", "sub": "OM2N-V6", "voltage": "100V", "freq": "", "fuel": "", "special": ""}, "OM2N004": {"spec": "オイルバーナ OM2N-V6WSP2 AC200V ", "series": "OM2N", "sub": "OM2N-V6", "voltage": "200V", "freq": "", "fuel": "", "special": ""}, "OM2N005": {"spec": "オイルバーナ OM2NP-V1WSP1 810 100V", "series": "OM2N", "sub": "OM2NP-V1", "voltage": "100V", "freq": "", "fuel": "", "special": ""}, "OM2N006": {"spec": "オイルバーナ OM2NP-V1WSP2 810 200V", "series": "OM2N", "sub": "OM2NP-V1", "voltage": "200V", "freq": "", "fuel": "", "special": ""}, "OM2N007": {"spec": "オイルバーナ OM2NP-V6WSP1 816　100V", "series": "OM2N", "sub": "OM2NP-V6", "voltage": "100V", "freq": "", "fuel": "", "special": ""}, "OM2N008": {"spec": "オイルバーナ OM2NP-V6WSP2 816　200V", "series": "OM2N", "sub": "OM2NP-V6", "voltage": "200V", "freq": "", "fuel": "", "special": ""}, "OM2N009": {"spec": "オイルバーナ OM2NP-V08WSP1 100V 808　Lo-2.0G/ｈ　Hi-1.0G/ｈ", "series": "OM2N", "sub": "OM2NP-V08", "voltage": "100V", "freq": "", "fuel": "", "special": ""}, "OM2N010": {"spec": "オイルバーナ OM2NPA-V1WSP1 100V 810DK", "series": "OM2N", "sub": "OM2NPA-V1", "voltage": "100V", "freq": "", "fuel": "", "special": ""}, "OM2N011": {"spec": "オイルバーナ OM2NPA-V1WSP2 200V 810DK", "series": "OM2N", "sub": "OM2NPA-V1", "voltage": "200V", "freq": "", "fuel": "", "special": ""}, "OM2N012": {"spec": "オイルバーナ OM2NPA-V6WSP1 100V 816BK", "series": "OM2N", "sub": "OM2NPA-V6", "voltage": "100V", "freq": "", "fuel": "", "special": ""}, "OM2N013": {"spec": "オイルバーナ OM2NPA-V6WSP2 200V 816BK", "series": "OM2N", "sub": "OM2NPA-V6", "voltage": "200V", "freq": "", "fuel": "", "special": ""}, "OT00004": {"spec": "オイルバーナ OT-25･5HK 200V ", "series": "OT", "sub": "25", "voltage": "200V", "freq": "50Hz", "fuel": "", "special": ""}, "OT00009": {"spec": "オイルバーナ OT-26WSP1　100V　1A2B1A-29314-1 ", "series": "OT", "sub": "26", "voltage": "100V", "freq": "", "fuel": "", "special": ""}, "OT00031": {"spec": "オイルバーナ 旧仕様　OT-52･5HWA-2 100V 116　100V　50Hz　A重油　CDS仕様", "series": "OT", "sub": "52", "voltage": "100V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OT00038": {"spec": "オイルバーナ OT-26WSP2　200V　1A2B1A-29314-1 ", "series": "OT", "sub": "26", "voltage": "200V", "freq": "", "fuel": "", "special": ""}, "OT00039": {"spec": "オイルバーナ OT-24A　100V ", "series": "OT", "sub": "24", "voltage": "100V", "freq": "", "fuel": "", "special": ""}, "OT00041": {"spec": "オイルバーナ OT-25XSP1 100V ", "series": "OT", "sub": "25", "voltage": "100V", "freq": "", "fuel": "", "special": ""}, "OTP0001": {"spec": "オイルバーナ OT-25･5HAP 100V 106　100V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "25", "voltage": "100V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0002": {"spec": "オイルバーナ OT-25･5HAP 200V 106　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "25", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0003": {"spec": "オイルバーナ OT-25･5HKP 100V 106　100V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "25", "voltage": "100V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0004": {"spec": "オイルバーナ OT-25･5HKP 200V 106　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "25", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0005": {"spec": "オイルバーナ OT-25･6HAP 200V 106　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "25", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0006": {"spec": "オイルバーナ OT-25･6HAP 100V 106　100V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "25", "voltage": "100V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0007": {"spec": "オイルバーナ OT-25･6HKP 100V 106　100V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "25", "voltage": "100V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0008": {"spec": "オイルバーナ OT-25･6HKP 200V 106　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "25", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0009": {"spec": "オイルバーナ OT-50･5HWAP 100V 109　100V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "50", "voltage": "100V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0010": {"spec": "オイルバーナ OT-50･5HWAP 200V 109　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "50", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0011": {"spec": "オイルバーナ OT-50･5HWKP 200V 109　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "50", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0012": {"spec": "オイルバーナ OT-50･5HWKP 100V 109　100V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "50", "voltage": "100V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0013": {"spec": "オイルバーナ OT-50･6HWAP 100V 109　100V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "50", "voltage": "100V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0014": {"spec": "オイルバーナ OT-50･6HWAP 200V 109　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "50", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0015": {"spec": "オイルバーナ OT-50･6HWKP 100V 109　100V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "50", "voltage": "100V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0016": {"spec": "オイルバーナ OT-50･6HWKP 200V 109　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "50", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0017": {"spec": "オイルバーナ OT-51･6HWAP-1 100V 112　100V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "100V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0018": {"spec": "オイルバーナ OT-51･6HWAP-1 200V 112　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0019": {"spec": "オイルバーナ OT-51･6HWAP-2 100V 116　100V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "100V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0020": {"spec": "オイルバーナ OT-51･6HWAP-2 200V 116　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0021": {"spec": "オイルバーナ OT-51･6HWAP-3 200V 120　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0022": {"spec": "オイルバーナ OT-51･6HWKP-1 100V 112　100V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "100V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0023": {"spec": "オイルバーナ OT-51･6HWKP-1 200V 112　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0024": {"spec": "オイルバーナ OT-51･6HWKP-2 100V 116　100V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "100V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0025": {"spec": "オイルバーナ OT-51･6HWKP-2 200V 116　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0026": {"spec": "オイルバーナ OT-51･6HWKP-3 200V 120　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0027": {"spec": "オイルバーナ OT-52･5HWAP-1 200V 112　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "52", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0028": {"spec": "オイルバーナ OT-52･5HWAP-1 100V 112　100V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "52", "voltage": "100V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0029": {"spec": "オイルバーナ OT-52･5HWAP-2 200V 116　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "52", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0030": {"spec": "オイルバーナ OT-52･5HWAP-2 100V 116　100V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "52", "voltage": "100V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0031": {"spec": "オイルバーナ OT-52･5HWAP-3 200V 120　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "52", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0032": {"spec": "オイルバーナ OT-52･5HWKP-1 100V 112　100V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "52", "voltage": "100V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0033": {"spec": "オイルバーナ OT-52･5HWKP-1 200V 112　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "52", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0034": {"spec": "オイルバーナ OT-52･5HWKP-2 100V 116　100V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "52", "voltage": "100V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0035": {"spec": "オイルバーナ OT-52･5HWKP-2 200V 116　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "52", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0036": {"spec": "オイルバーナ OT-52･5HWKP-3 200V 120　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "52", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0045": {"spec": "オイルバーナ 熱帯仕様 OT-50･5HWKP 200V ", "series": "OT", "sub": "50", "voltage": "200V", "freq": "50Hz", "fuel": "", "special": "熱帯仕様"}, "OTP0046": {"spec": "オイルバーナ 進相コンデンサ仕様 OT-52･5HWAP-2 200V ", "series": "OT", "sub": "52", "voltage": "200V", "freq": "50Hz", "fuel": "", "special": "進相コンデンサ仕様"}, "OTP0048": {"spec": "オイルバーナ 特殊 OT-51･6HWBP-3 200V ", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "", "special": "特殊"}, "OTP0049": {"spec": "オイルバーナ 国土交通省仕様 OT-52･5HWAP-3 120　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "52", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": "国土交通省仕様"}, "OTP0051": {"spec": "オイルバーナー 特殊 OT-52･5HWAP-2 ", "series": "OT", "sub": "52", "voltage": "", "freq": "50Hz", "fuel": "", "special": "特殊"}, "OTP0052": {"spec": "オイルバーナ 特 OT-50･5HWAP A重油 200V ", "series": "OT", "sub": "50", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": "特殊"}, "OTP0053": {"spec": "オイルバーナ 特 OT-52･5HWKP-1CX (BCR ", "series": "OT", "sub": "52", "voltage": "", "freq": "50Hz", "fuel": "", "special": "特殊"}, "OTP0055": {"spec": "オイルバーナ 特殊 OT-51･6HWBP-2 200V ", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "", "special": "特殊"}, "OTP0056": {"spec": "オイルバーナ 特殊 OTC-51･6HWAP-3 四位置仕様 ", "series": "OT", "sub": "51", "voltage": "", "freq": "60Hz", "fuel": "", "special": "四位置仕様"}, "OTP0057": {"spec": "オイルバーナ 特殊 OT-52･5HWBP-3 200V 5 ", "series": "OT", "sub": "52", "voltage": "200V", "freq": "50Hz", "fuel": "", "special": "特殊"}, "OTP0058": {"spec": "オイルバーナ 燃料:軽油 OT-51･6HWAP-3 200V 6 ", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "軽油", "special": ""}, "OTP0059": {"spec": "オイルバーナ 国土交通省仕様 OT-51･6HWAP-3 120　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": "国土交通省仕様"}, "OTP0060": {"spec": "オイルバーナ 特 OT-52･5HWAP-2 ", "series": "OT", "sub": "52", "voltage": "", "freq": "50Hz", "fuel": "", "special": "特殊"}, "OTP0061": {"spec": "オイルバーナ OT-52･5HWAP-1 10万用 100V 110(109)　100V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ", "series": "OT", "sub": "52", "voltage": "100V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0062": {"spec": "オイルバーナ OT-45・5HWAP 100V LH108　100V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "45", "voltage": "100V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0063": {"spec": "オイルバーナ OT-45・5WKP 100V LH108　100V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "45", "voltage": "100V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0064": {"spec": "オイルバーナ OT-45・6HWAP 100V LH108　100V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "45", "voltage": "100V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0065": {"spec": "オイルバーナ OT-45・6HWKP 100V LH108　100V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "45", "voltage": "100V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0066": {"spec": "オイルバーナ OT-45・5HWAP 200V LH108　200V　50Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "45", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0067": {"spec": "オイルバーナ OT-45・5HWKP 200V LH108　200V　50Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "45", "voltage": "200V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0068": {"spec": "オイルバーナ OT-45・6HWAP 200V LH108　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "45", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0069": {"spec": "オイルバーナ OT-45・6HWKP 200V LH108　200V　60Hz　灯油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "45", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0070": {"spec": "オイルバーナ トンネル仕様 OT-52・5HWAP-3 120 200V 50Hz A重油 ボックス加工", "series": "OT", "sub": "52", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": "トンネル仕様"}, "OTP0071": {"spec": "オイルバーナ OT-52・5HWAP-0 L110用　10万kcal　A重油/50Hz", "series": "OT", "sub": "52", "voltage": "", "freq": "50Hz", "fuel": "A重油", "special": ""}, "OTP0072": {"spec": "オイルバーナ OT-52・5HWKP-0 L110用　10万kcal　灯油/50Hz", "series": "OT", "sub": "52", "voltage": "", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0073": {"spec": "オイルバーナ OT-51・6HWAP-0 BH-L110用　10万kcal　A重油　200V/60Hz", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": ""}, "OTP0074": {"spec": "オイルバーナ OT-51・6HWKP-0 10万kcal　灯油　200V/60Hz", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0075": {"spec": "オイルバーナ トンネル仕様 OT-52・5HWAP-1 L112用　A重油　200V 50Hz　ボックス加工", "series": "OT", "sub": "52", "voltage": "200V", "freq": "50Hz", "fuel": "A重油", "special": "トンネル仕様"}, "OTP0076": {"spec": "オイルバーナ 国土交通省仕様 OT-51･6HWKP-3 ", "series": "OT", "sub": "51", "voltage": "", "freq": "60Hz", "fuel": "", "special": "国土交通省仕様"}, "OTP0077": {"spec": "オイルバーナ OT-52・5HWKP-0 10万kcal　灯油　100V/50Hz", "series": "OT", "sub": "52", "voltage": "100V", "freq": "50Hz", "fuel": "灯油", "special": ""}, "OTP0078": {"spec": "オイルバーナ OT-51・6HWKP-0 10万kcal　灯油　100V/60Hz", "series": "OT", "sub": "51", "voltage": "100V", "freq": "60Hz", "fuel": "灯油", "special": ""}, "OTP0079": {"spec": "オイルバーナ　国土交通省仕様 OT-51・6HWAP-1 112　200V　60Hz　A重油　ﾌｫﾄﾀﾞｲｵｰﾄﾞ仕様", "series": "OT", "sub": "51", "voltage": "200V", "freq": "60Hz", "fuel": "A重油", "special": "国土交通省仕様"}, "OTP0080": {"spec": "オイルバーナ OT-50・6HWBPX 109　100V　60Hz　BDF仕様", "series": "OT", "sub": "50", "voltage": "100V", "freq": "60Hz", "fuel": "BDF", "special": "BDF仕様"}};
+
+const SUB_OPTIONS = {
+  'OT':   ['25','45','50','51','52'],
+  'LT':   ['62','81'],
+  'LTN':  ['120','150','200'],
+  'FL':   ['25','40','60'],
+  'OM2N': ['OM2N-V1','OM2N-V6','OM2NP-V1','OM2NP-V6','OM2NP-V08','OM2NPA-V1','OM2NPA-V6'],
+  'BLT':  ['62'],
+  'その他': []
+};
+
+let specSearchTarget = 'receive'; // 'receive' or 'stocktake'
+
+window.openSpecSearch = (target) => {
+  specSearchTarget = target;
+  // リセット
+  ['ss-series','ss-sub','ss-voltage','ss-freq','ss-fuel','ss-special'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+  document.getElementById('ss-sub').disabled = true;
+  document.getElementById('ss-sub').innerHTML = '<option value="">-- ①を先に選択 --</option>';
+  document.getElementById('ss-result-body').innerHTML = '<tr><td colspan="3" style="text-align:center;color:#94a3b8">条件を選択してください</td></tr>';
+  document.getElementById('ss-result-count').textContent = '条件を選択してください';
+  document.getElementById('spec-search-modal').style.display = 'flex';
+};
+
+window.closeSpecSearch = () => {
+  document.getElementById('spec-search-modal').style.display = 'none';
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('spec-search-modal').addEventListener('click', e => {
+    if (e.target === e.currentTarget) closeSpecSearch();
+  });
+});
+
+window.onSeriesChange = () => {
+  const series = document.getElementById('ss-series').value;
+  const subSel = document.getElementById('ss-sub');
+  subSel.innerHTML = '<option value="">-- 指定なし --</option>';
+  if (series && SUB_OPTIONS[series] && SUB_OPTIONS[series].length > 0) {
+    SUB_OPTIONS[series].forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s;
+      opt.textContent = series === 'OM2N' ? s : series + '-' + s;
+      subSel.appendChild(opt);
+    });
+    subSel.disabled = false;
+  } else {
+    subSel.disabled = true;
+  }
+  onFilterChange();
+};
+
+window.onFilterChange = () => {
+  const series  = document.getElementById('ss-series').value;
+  const sub     = document.getElementById('ss-sub').value;
+  const voltage = document.getElementById('ss-voltage').value;
+  const freq    = document.getElementById('ss-freq').value;
+  const fuel    = document.getElementById('ss-fuel').value;
+  const special = document.getElementById('ss-special').value;
+
+  if (!series) {
+    document.getElementById('ss-result-count').textContent = 'シリーズを選択してください';
+    document.getElementById('ss-result-body').innerHTML = '<tr><td colspan="3" style="text-align:center;color:#94a3b8">①シリーズを選択してください</td></tr>';
+    return;
+  }
+
+  const matched = Object.entries(SPEC_MASTER).filter(([partno, data]) => {
+    if (data.series !== series) return false;
+    if (sub     && data.sub     !== sub)     return false;
+    if (voltage && data.voltage !== voltage && data.voltage !== '両方') return false;
+    if (freq    && data.freq    !== freq    && data.freq    !== '両方') return false;
+    if (fuel    && data.fuel    !== fuel)    return false;
+    if (special && data.special !== special) return false;
+    if (!special && data.special) return false; // 特殊仕様未選択なら標準品のみ
+    return true;
+  });
+
+  const count = document.getElementById('ss-result-count');
+  const body  = document.getElementById('ss-result-body');
+  count.textContent = `${matched.length}件`;
+
+  if (matched.length === 0) {
+    body.innerHTML = '<tr><td colspan="3" style="text-align:center;color:#94a3b8">該当なし</td></tr>';
+    return;
+  }
+
+  body.innerHTML = matched.map(([partno, data]) => `
+    <tr>
+      <td style="white-space:nowrap;font-weight:700">${partno}</td>
+      <td style="font-size:11px">${data.spec}</td>
+      <td><button class="btn btn-primary btn-sm" onclick="selectSpecResult('${partno}','${data.spec.replace(/'/g,"\\'")}')">選択</button></td>
+    </tr>
+  `).join('');
+};
+
+window.selectSpecResult = (partno, spec) => {
+  if (specSearchTarget === 'receive') {
+    document.getElementById('f-partno').value = partno;
+    document.getElementById('f-spec').value = spec;
+  } else {
+    document.getElementById('st-add-partno').value = partno;
+    document.getElementById('st-add-spec').value = spec;
+  }
+  closeSpecSearch();
+};
+</script>
+
+<!-- ===== 棚卸スクリプト ===== -->
+<script type="module">
+  import { initializeApp, getApps } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, doc, setDoc, getDoc, getDocs, collection, addDoc, deleteDoc, Timestamp }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyA33aqmYVplQE77FVpbXgZPFH27jyx2SvE",
+    authDomain: "jidou-souko.firebaseapp.com",
+    projectId: "jidou-souko",
+    storageBucket: "jidou-souko.firebasestorage.app",
+    messagingSenderId: "764306513933",
+    appId: "1:764306513933:web:7294dd6f2b3571165c7544"
+  };
+
+  const app3 = getApps().find(a => a.name === '[DEFAULT]') || initializeApp(firebaseConfig);
+  const db3 = getFirestore(app3);
+
+  // 棚卸の進捗はFirestoreの 'stocktake' コレクションに保存
+  // ドキュメントID = ロケID、フィールド: done(bool)
+  let stChecked = {}; // { locId: true } 確認済みロケ
+
+  const today = () => new Date().toISOString().slice(0, 10);
+
+  // ===== 棚卸画面を開く =====
+  window.openStocktake = async () => {
+    document.getElementById('app-screen').style.display = 'none';
+    document.getElementById('stocktake-screen').style.display = 'block';
+    await loadStocktake();
+  };
+
+  window.closeStocktake = () => {
+    if (!confirm('棚卸を中断して戻りますか？\n（進捗は保存されています）')) return;
+    document.getElementById('stocktake-screen').style.display = 'none';
+    document.getElementById('app-screen').style.display = 'block';
+    // メイン画面のグリッドを再描画
+    if (window.__reloadMain) window.__reloadMain();
+  };
+
+  // ===== データ読み込み =====
+  async function loadStocktake() {
+    const list = document.getElementById('stocktake-list');
+    list.innerHTML = '<p style="color:#64748b;font-size:13px;padding:16px">読み込み中...</p>';
+
+    // ロケデータ取得
+    const locSnap = await getDocs(collection(db3, 'locations'));
+    const locs = {};
+    locSnap.forEach(d => { locs[d.id] = d.data(); });
+
+    // 棚卸進捗取得
+    const stSnap = await getDocs(collection(db3, 'stocktake'));
+    stChecked = {};
+    stSnap.forEach(d => { stChecked[d.id] = d.data().done; });
+
+    // オリンピアバーナ置場のロケのみ対象
+    const targets = Object.entries(locs)
+      .filter(([id, data]) => data.type === 'olympia')
+      .sort(([a], [b]) => {
+        // 号機→連→段 でソート（デフォルト順）
+        const pa = a.split('-').map(Number);
+        const pb = b.split('-').map(Number);
+        for (let i = 0; i < 3; i++) {
+          if (pa[i] !== pb[i]) return pa[i] - pb[i];
+        }
+        return 0;
+      });
+
+    renderStocktakeList(targets, locs);
+    updateProgress(targets.length);
+  }
+
+  function renderStocktakeList(targets, locs) {
+    const list = document.getElementById('stocktake-list');
+    if (targets.length === 0) {
+      list.innerHTML = '<p style="color:#94a3b8;font-size:13px;padding:16px">オリンピアバーナ置場が登録されていません</p>';
+      return;
+    }
+
+    list.innerHTML = targets.map(([id, data]) => {
+      const items = data.items || [];
+      const isDone = stChecked[id] || false;
+      const summary = items.length === 0 ? '空'
+        : data.full || items.length >= 2 ? `${items.length}個（満）`
+        : `${items.length}個`;
+
+      let itemsTable = '';
+      if (items.length > 0) {
+        itemsTable = `<div class="st-current-items">
+          <table>
+            <thead><tr><th>部品番号</th><th>型式・仕様</th><th>製造番号</th><th>入庫日</th></tr></thead>
+            <tbody>
+              ${items.map((item, idx) => `
+                <tr>
+                  <td>${item.partNo}</td>
+                  <td style="max-width:140px;word-break:break-all">${item.spec}</td>
+                  <td>${item.serialNo}</td>
+                  <td>${item.inDate}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>`;
+      } else {
+        itemsTable = '<p style="font-size:12px;color:#94a3b8;margin-bottom:8px">システム上：空</p>';
+      }
+
+      return `
+        <div class="stocktake-item${isDone ? ' done' : ''}" id="st-item-${id}">
+          <div class="stocktake-item-header" onclick="toggleStItem('${id}')">
+            <div class="stocktake-loc">${id}</div>
+            <div class="stocktake-summary">システム：${summary}</div>
+            <div class="stocktake-check">${isDone ? '✓' : ''}</div>
+          </div>
+          <div class="stocktake-item-body">
+            <p style="font-size:11px;color:#94a3b8;margin-bottom:8px">システム上の登録内容：</p>
+            ${itemsTable}
+            <div class="st-actions">
+              <button class="btn btn-primary btn-sm" onclick="stConfirm('${id}')">✓ 現物一致・確認済み</button>
+              ${items.map((item, idx) => `
+                <button class="btn btn-danger btn-sm" onclick="stRemoveItem('${id}',${idx},'${item.partNo}','${item.serialNo}')">
+                  「${item.serialNo}」を削除（現物なし）
+                </button>
+              `).join('')}
+              <button class="btn btn-secondary btn-sm" onclick="stAddItem('${id}')">＋ 現物あり・入庫登録</button>
+            </div>
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  // ===== アコーディオン開閉 =====
+  window.toggleStItem = (id) => {
+    const el = document.getElementById(`st-item-${id}`);
+    el.classList.toggle('open');
+  };
+
+  // ===== 進捗更新 =====
+  function updateProgress(total) {
+    const done = Object.values(stChecked).filter(v => v).length;
+    const pct = total > 0 ? Math.round(done / total * 100) : 0;
+    document.getElementById('st-progress-text').textContent =
+      `進捗：${done} / ${total} ロケ確認済み（${pct}%）`;
+    document.getElementById('st-progress-bar').style.width = pct + '%';
+  }
+
+  // ===== 確認済みにする =====
+  window.stConfirm = async (id) => {
+    await setDoc(doc(db3, 'stocktake', id), { done: true, confirmedAt: Timestamp.now() });
+    stChecked[id] = true;
+    const el = document.getElementById(`st-item-${id}`);
+    el.classList.add('done');
+    el.classList.remove('open');
+    el.querySelector('.stocktake-check').textContent = '✓';
+
+    // 進捗再計算
+    const total = document.querySelectorAll('[id^="st-item-"]').length;
+    updateProgress(total);
+  };
+
+  // ===== 現物なし→削除 =====
+  window.stRemoveItem = async (locId, idx, partNo, serialNo) => {
+    if (!confirm(`「${serialNo}」を削除しますか？\n（棚卸差異として記録されます）`)) return;
+
+    // ロケのitemsから削除
+    const locRef = doc(db3, 'locations', locId);
+    const locSnap = await getDoc(locRef);
+    const locData = locSnap.data();
+    const items = [...(locData.items || [])];
+    const removed = items.splice(idx, 1)[0];
+    const full = items.length >= 2;
+    await setDoc(locRef, { ...locData, items, full });
+
+    // 棚卸差異として履歴に記録
+    await addDoc(collection(db3, 'history'), {
+      action: 'stocktake_diff',
+      locId,
+      ...removed,
+      outDate: today(),
+      outMemo: '棚卸差異（現物なし）',
+      timestamp: Timestamp.now(),
+    });
+
+    // メインのlocationsDataも更新
+    if (window.__updateLocData) window.__updateLocData(locId, { ...locData, items, full });
+
+    await loadStocktake();
+  };
+
+  // ===== 現物あり→入庫登録モーダル =====
+  window.stAddItem = (locId) => {
+    document.getElementById('st-add-locid').value = locId;
+    document.getElementById('st-add-partno').value = '';
+    document.getElementById('st-add-spec').value = '';
+    document.getElementById('st-add-serial').value = '';
+    document.getElementById('st-add-indate').value = today();
+    document.getElementById('st-add-msg').textContent = '';
+    document.getElementById('st-add-modal').style.display = 'flex';
+  };
+
+  window.closeStAddModal = () => {
+    document.getElementById('st-add-modal').style.display = 'none';
+  };
+
+  window.stOnPartNoInput = () => {
+    const partNo = document.getElementById('st-add-partno').value.trim();
+    const master = window.__getItemMaster ? window.__getItemMaster() : [];
+    const found = master.find(item => item.id === partNo);
+    document.getElementById('st-add-spec').value = found ? (found.spec || '') : '';
+  };
+
+  window.stTogglePartSearch = () => {
+    const area = document.getElementById('st-add-search-area');
+    area.style.display = area.style.display === 'none' ? 'block' : 'none';
+  };
+
+  window.stSearchItem = () => {
+    const q = document.getElementById('st-add-search').value.trim().toLowerCase();
+    const results = document.getElementById('st-add-search-results');
+    if (!q) { results.style.display = 'none'; return; }
+    const master = window.__getItemMaster ? window.__getItemMaster() : [];
+    const matched = master.filter(item =>
+      (item.spec || '').toLowerCase().includes(q) ||
+      (item.id   || '').toLowerCase().includes(q)
+    ).slice(0, 10);
+    if (matched.length === 0) {
+      results.innerHTML = '<div class="search-item no-result">該当なし</div>';
+    } else {
+      results.innerHTML = matched.map(item =>
+        `<div class="search-item" onclick="stSelectItem('${item.id}','${(item.spec||'').replace(/'/g,"\\'")}')">
+          <span class="search-partno">${item.id}</span>
+          <span class="search-spec">${item.spec||''}</span>
+        </div>`
+      ).join('');
+    }
+    results.style.display = 'block';
+  };
+
+  window.stSelectItem = (partNo, spec) => {
+    document.getElementById('st-add-partno').value = partNo;
+    document.getElementById('st-add-spec').value = spec;
+    document.getElementById('st-add-search').value = '';
+    document.getElementById('st-add-search-results').style.display = 'none';
+    document.getElementById('st-add-search-area').style.display = 'none';
+  };
+
+  window.stDoAddItem = async () => {
+    const locId  = document.getElementById('st-add-locid').value;
+    const partNo = document.getElementById('st-add-partno').value.trim();
+    const spec   = document.getElementById('st-add-spec').value.trim();
+    const serial = document.getElementById('st-add-serial').value.trim();
+    const inDate = document.getElementById('st-add-indate').value;
+    const msg    = document.getElementById('st-add-msg');
+
+    if (!partNo || !serial || !inDate) {
+      msg.style.color = '#ef4444';
+      msg.textContent = '部品番号・製造番号・入庫日は必須です';
+      return;
+    }
+
+    const locRef  = doc(db3, 'locations', locId);
+    const locSnap = await getDoc(locRef);
+    const locData = locSnap.data();
+    const items = [...(locData.items || [])];
+    const newItem = { partNo, spec, serialNo: serial, inDate, note: '棚卸時入庫登録' };
+    items.push(newItem);
+    const full = items.length >= 2;
+    await setDoc(locRef, { ...locData, items, full });
+
+    await addDoc(collection(db3, 'history'), {
+      action: 'in',
+      locId,
+      partNo, spec, serialNo: serial, inDate,
+      note: '棚卸時入庫登録',
+      timestamp: Timestamp.now(),
+    });
+
+    if (window.__updateLocData) window.__updateLocData(locId, { ...locData, items, full });
+
+    msg.style.color = '#16a34a';
+    msg.textContent = '✓ 登録しました';
+    setTimeout(() => {
+      closeStAddModal();
+      loadStocktake();
+    }, 800);
+  };
+
+  // メインスクリプトへのitemMasterアクセス用
+  window.__getItemMaster = () => window.__itemMasterRef || [];
+</script>
+
+<!-- ===== 在庫検索モーダル ===== -->
+<div class="modal-overlay" id="stock-search-modal">
+  <div class="modal-box" style="max-width:640px">
+    <div class="modal-header">
+      <h3>在庫検索</h3>
+      <button class="modal-close" onclick="closeStockSearch()">×</button>
+    </div>
+
+    <!-- 絞り込み条件（絞り込み検索と同じ構造） -->
+    <div style="display:grid;gap:8px;margin-bottom:12px">
+      <div class="form-row">
+        <label style="white-space:nowrap">①シリーズ</label>
+        <select id="sk-series" onchange="onSkSeriesChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px">
+          <option value="">-- 選択 --</option>
+          <option value="OT">OT系</option>
+          <option value="LT">LT系</option>
+          <option value="LTN">LTN系</option>
+          <option value="FL">FL系</option>
+          <option value="OM2N">OM2N系</option>
+          <option value="BLT">BLT系（天然塩釜用）</option>
+          <option value="その他">その他</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label style="white-space:nowrap">②型式</label>
+        <select id="sk-sub" onchange="onSkFilterChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px" disabled>
+          <option value="">-- ①を先に選択 --</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label style="white-space:nowrap">③電圧</label>
+        <select id="sk-voltage" onchange="onSkFilterChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px">
+          <option value="">指定なし</option>
+          <option value="100V">100V</option>
+          <option value="200V">200V</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label style="white-space:nowrap">④周波数</label>
+        <select id="sk-freq" onchange="onSkFilterChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px">
+          <option value="">指定なし</option>
+          <option value="50Hz">50Hz</option>
+          <option value="60Hz">60Hz</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label style="white-space:nowrap">⑤燃料</label>
+        <select id="sk-fuel" onchange="onSkFilterChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px">
+          <option value="">指定なし</option>
+          <option value="A重油">A重油</option>
+          <option value="灯油">灯油</option>
+          <option value="BDF">BDF</option>
+          <option value="軽油">軽油</option>
+          <option value="廃油">廃油</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label style="white-space:nowrap">⑥特殊仕様</label>
+        <select id="sk-special" onchange="onSkFilterChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px">
+          <option value="">標準</option>
+          <option value="国土交通省仕様">国土交通省仕様</option>
+          <option value="天然塩釜用">天然塩釜用</option>
+          <option value="トンネル仕様">トンネル仕様</option>
+          <option value="低NOx仕様">低NOx仕様</option>
+          <option value="BDF仕様">BDF仕様</option>
+          <option value="熱帯仕様">熱帯仕様</option>
+          <option value="進相コンデンサ仕様">進相コンデンサ仕様</option>
+          <option value="特殊">その他特殊</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- 検索結果 -->
+    <div style="font-size:12px;color:#64748b;margin-bottom:6px" id="sk-result-count">条件を選択してください</div>
+    <div style="max-height:360px;overflow-y:auto;overflow-x:auto;border:1px solid #e5e7eb;border-radius:6px">
+      <table class="history-table" style="width:100%;min-width:480px">
+        <thead>
+          <tr>
+            <th>ロケ</th>
+            <th>部品番号</th>
+            <th>型式/電圧</th>
+            <th>製造番号</th>
+            <th>入庫日</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="sk-result-body">
+          <tr><td colspan="6" style="text-align:center;color:#94a3b8">条件を選択してください</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="font-size:11px;color:#94a3b8;margin-top:6px">※入庫日が古い順に表示しています</p>
+  </div>
+</div>
+
+<!-- ===== 絞り込み検索モーダル ===== -->
+<div class="modal-overlay" id="spec-search-modal">
+  <div class="modal-box" style="max-width:560px">
+    <div class="modal-header">
+      <h3>部品番号 絞り込み検索</h3>
+      <button class="modal-close" onclick="closeSpecSearch()">×</button>
+    </div>
+
+    <div style="display:grid;gap:10px;margin-bottom:14px">
+      <!-- ①シリーズ -->
+      <div class="form-row">
+        <label style="white-space:nowrap">①シリーズ</label>
+        <select id="ss-series" onchange="onSeriesChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px">
+          <option value="">-- 選択 --</option>
+          <option value="OT">OT系</option>
+          <option value="LT">LT系</option>
+          <option value="LTN">LTN系</option>
+          <option value="FL">FL系</option>
+          <option value="OM2N">OM2N系</option>
+          <option value="BLT">BLT系（天然塩釜用）</option>
+          <option value="その他">その他</option>
+        </select>
+      </div>
+      <!-- ②サブ型式 -->
+      <div class="form-row">
+        <label style="white-space:nowrap">②型式</label>
+        <select id="ss-sub" onchange="onFilterChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px" disabled>
+          <option value="">-- ①を先に選択 --</option>
+        </select>
+      </div>
+      <!-- ③電圧 -->
+      <div class="form-row">
+        <label style="white-space:nowrap">③電圧</label>
+        <select id="ss-voltage" onchange="onFilterChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px">
+          <option value="">-- 指定なし --</option>
+          <option value="100V">100V</option>
+          <option value="200V">200V</option>
+        </select>
+      </div>
+      <!-- ④周波数 -->
+      <div class="form-row">
+        <label style="white-space:nowrap">④周波数</label>
+        <select id="ss-freq" onchange="onFilterChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px">
+          <option value="">-- 指定なし --</option>
+          <option value="50Hz">50Hz</option>
+          <option value="60Hz">60Hz</option>
+        </select>
+      </div>
+      <!-- ⑤燃料 -->
+      <div class="form-row">
+        <label style="white-space:nowrap">⑤燃料</label>
+        <select id="ss-fuel" onchange="onFilterChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px">
+          <option value="">-- 指定なし --</option>
+          <option value="A重油">A重油</option>
+          <option value="灯油">灯油</option>
+          <option value="BDF">BDF</option>
+          <option value="軽油">軽油</option>
+          <option value="廃油">廃油</option>
+        </select>
+      </div>
+      <!-- ⑥特殊仕様 -->
+      <div class="form-row">
+        <label style="white-space:nowrap">⑥特殊仕様</label>
+        <select id="ss-special" onchange="onFilterChange()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px">
+          <option value="">-- 指定なし（標準） --</option>
+          <option value="国土交通省仕様">国土交通省仕様</option>
+          <option value="天然塩釜用">天然塩釜用</option>
+          <option value="トンネル仕様">トンネル仕様</option>
+          <option value="低NOx仕様">低NOx仕様</option>
+          <option value="BDF仕様">BDF仕様</option>
+          <option value="熱帯仕様">熱帯仕様</option>
+          <option value="進相コンデンサ仕様">進相コンデンサ仕様</option>
+          <option value="特殊">その他特殊</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- 絞り込み結果 -->
+    <div style="font-size:12px;color:#64748b;margin-bottom:6px" id="ss-result-count">条件を選択してください</div>
+    <div style="max-height:280px;overflow-y:auto;border:1px solid #e5e7eb;border-radius:6px">
+      <table class="history-table" style="width:100%">
+        <thead>
+          <tr><th>部品番号</th><th>型式・仕様</th><th></th></tr>
+        </thead>
+        <tbody id="ss-result-body">
+          <tr><td colspan="3" style="text-align:center;color:#94a3b8">条件を選択してください</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 棚卸・入庫登録モーダル ===== -->
+<div class="modal-overlay" id="st-add-modal">
+  <div class="modal-box" style="max-width:480px">
+    <div class="modal-header">
+      <h3>現物あり・入庫登録（棚卸）</h3>
+      <button class="modal-close" onclick="closeStAddModal()">×</button>
+    </div>
+    <input type="hidden" id="st-add-locid">
+    <div class="form-row">
+      <label>部品番号</label>
+      <input id="st-add-partno" type="text" placeholder="例: 302030A0" oninput="stOnPartNoInput()" autocomplete="off">
+    </div>
+    <div class="form-row">
+      <label>型式・仕様</label>
+      <input id="st-add-spec" type="text" placeholder="部品番号入力で自動入力">
+    </div>
+    <div style="margin-bottom:10px">
+      <button type="button" class="btn btn-secondary btn-sm" onclick="openSpecSearch('stocktake')" style="font-size:11px">
+        🔍 部品番号がわからない場合はこちら（絞り込み検索）
+      </button>
+    </div>
+    <div class="form-row">
+      <label>製造番号</label>
+      <input id="st-add-serial" type="text" placeholder="例: 2024001">
+    </div>
+    <div class="form-row">
+      <label>入庫日</label>
+      <input id="st-add-indate" type="date">
+    </div>
+    <div id="st-add-msg" style="font-size:12px;min-height:18px;margin-bottom:8px"></div>
+    <div class="modal-actions">
+      <button class="btn btn-primary" onclick="stDoAddItem()">入庫登録</button>
+      <button class="btn btn-secondary" onclick="closeStAddModal()">キャンセル</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
