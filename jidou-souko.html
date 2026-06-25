@@ -672,7 +672,7 @@
     for (const id of sortedIds) {
       const loc = locationsData[id];
       if (loc.type === 'other') {
-        rows.push([id, '', '', '', '', '', '管理外（使用中）']);
+        // 管理外は出力しない
       } else if (loc.type === 'olympia') {
         const items = loc.items || [];
         if (items.length === 0) {
