@@ -814,7 +814,7 @@
   .hamburger-menu {
     display: none;
     position: absolute;
-    top: 52px;
+    top: 100%;
     right: 0;
     background: #1e293b;
     border: 1px solid #334155;
@@ -1319,17 +1319,18 @@
         <button class="btn btn-outline" style="color:#fff;border-color:#475569" onclick="doLogout()">ログアウト</button>
       </div>
       <!-- スマホ: ハンバーガーメニュー -->
-      <button class="hamburger-btn" onclick="toggleHamburger()" id="hamburger-btn">☰</button>
-    </div>
-    <!-- ハンバーガードロップダウン -->
-    <div class="hamburger-menu" id="hamburger-menu">
-      <button onclick="openStockSearch();closeHamburger()">在庫検索/出庫処理</button>
-      <button onclick="openHistory();closeHamburger()">入出庫履歴</button>
-      <button onclick="openStocktake();closeHamburger()">棚卸</button>
-      <button onclick="openMasterModal();closeHamburger()">品目マスタ</button>
-      <button onclick="exportCSV();closeHamburger()">CSVエクスポート</button>
-      <button onclick="createSnapshot();closeHamburger()">復元ポイント作成</button>
-      <button onclick="doLogout()">ログアウト</button>
+      <div style="position:relative">
+        <button class="hamburger-btn" onclick="toggleHamburger()" id="hamburger-btn">☰</button>
+        <div class="hamburger-menu" id="hamburger-menu">
+          <button onclick="openStockSearch();closeHamburger()">在庫検索/出庫処理</button>
+          <button onclick="openHistory();closeHamburger()">入出庫履歴</button>
+          <button onclick="openStocktake();closeHamburger()">棚卸</button>
+          <button onclick="openMasterModal();closeHamburger()">品目マスタ</button>
+          <button onclick="exportCSV();closeHamburger()">CSVエクスポート</button>
+          <button onclick="createSnapshot();closeHamburger()">復元ポイント作成</button>
+          <button onclick="doLogout()">ログアウト</button>
+        </div>
+      </div>
     </div>
   </header>
 
